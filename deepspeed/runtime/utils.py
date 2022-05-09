@@ -365,7 +365,7 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
                 total_norm += param_norm.item()**norm_type
 
         # Sum across all model parallel GPUs.
-        total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
+        total_norm_cuda = torch.FloatTensor([float(total_norm)]).to(p.grad.device)
         if mpu is not None:
             torch.distributed.all_reduce(total_norm_cuda,
                                          op=torch.distributed.ReduceOp.SUM,
@@ -376,7 +376,7 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
     pg = groups._get_data_parallel_group()
     scaled_norm = total_norm * 1.0 / float(dist.get_world_size(group=pg))
 
-    scaled_norm_tensor = torch.cuda.FloatTensor([float(scaled_norm)])
+    scaled_norm_tensor = torch.FloatTensor([float(scaled_norm)]).to(total_norm_cuda.device)
     dist.all_reduce(scaled_norm_tensor, group=pg)
     total_norm = scaled_norm_tensor.item()
 
@@ -867,3 +867,7 @@ def get_only_unique_item(items):
     unique_item, = item_set
 
     return unique_item
+
+
+def typeof(obj):
+    return obj.dtype if hasattr(obj, 'dtype') else obj.type()
