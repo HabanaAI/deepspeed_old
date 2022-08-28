@@ -147,7 +147,11 @@ def parse_args(args=None):
                         help="User script to launch, followed by any required "
                         "arguments.")
     parser.add_argument('user_args', nargs=argparse.REMAINDER)
-    return parser.parse_args(args=args)
+
+    args = parser.parse_args(args=args)
+    args.use_hpu = "--use_hpu" in args.user_args
+
+    return args
 
 
 def fetch_hostfile(hostfile_path):
@@ -334,9 +338,18 @@ def main(args=None):
             raise ValueError("Cannot specify num_nodes/gpus with include/exclude")
 
     multi_node_exec = True
+
+    device_count = 0
     if not resource_pool:
         resource_pool = {}
-        device_count = torch.cuda.device_count()
+        print(args)
+        if args.use_hpu:
+            import habana_frameworks.torch.core as htcore
+            device_count = htcore.get_device_count()
+        elif torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+        else:
+            device_count = args.num_gpus
         if device_count == 0:
             raise RuntimeError("Unable to proceed, no GPU resources available")
         resource_pool['localhost'] = device_count

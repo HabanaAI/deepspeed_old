@@ -52,7 +52,7 @@ from deepspeed.utils import logger, log_dist, init_distributed, instrument_w_nvt
 from deepspeed.utils.timer import ThroughputTimer, SynchronizedWallClockTimer
 from deepspeed.utils.debug import debug_extract_module_and_param_names
 from deepspeed.runtime.progressive_layer_drop import ProgressiveLayerDrop
-from deepspeed.runtime.utils import clip_grad_norm_
+from deepspeed.runtime.utils import clip_grad_norm_, typeof
 from deepspeed.runtime.eigenvalue import Eigenvalue
 from deepspeed.runtime.data_pipeline.curriculum_scheduler import CurriculumScheduler
 
@@ -87,19 +87,19 @@ except ImportError:
 
 def split_half_float_double_sparse(tensors):
     supported_types = [
-        "torch.cuda.HalfTensor",
-        "torch.cuda.FloatTensor",
-        "torch.cuda.DoubleTensor",
-        "torch.cuda.BFloat16Tensor",
+        torch.float16,
+        torch.float32,
+        torch.float64,
+        torch.bfloat16,
         SparseTensor.type()
     ]
 
     for t in tensors:
-        assert t.type() in supported_types, f"attempting to reduce an unsupported grad type: {t.type()}"
+        assert typeof(t) in supported_types, f"attempting to reduce an unsupported grad type: {typeof(t)}"
 
     buckets = []
     for i, dtype in enumerate(supported_types):
-        bucket = [t for t in tensors if t.type() == dtype]
+        bucket = [t for t in tensors if typeof(t) == dtype]
         if bucket:
             buckets.append((dtype, bucket))
     return buckets
@@ -204,7 +204,9 @@ class DeepSpeedEngine(Module):
         self.eigenvalue = None
         self.block_eigenvalue = None
         self.gas_boundary_ctr = 0
-        self.dist_backend = "nccl"
+        self.use_hpu = args.use_hpu
+        self.no_cuda = args.no_cuda
+        self.dist_backend = "hccl" if args.use_hpu else "nccl" if not args.no_cuda else "gloo"
         self.has_moe_layers = False
         self.num_experts = []
         self.gate_modules = []
@@ -239,6 +241,14 @@ class DeepSpeedEngine(Module):
         self._do_sanity_check()
         see_memory_usage(f"DeepSpeed Engine: After args sanity test",
                          force=self.memory_breakdown())
+
+        if self.fp16_enabled() and args.use_hpu:
+            raise ValueError("Type fp16 is not supported on HPU.")
+
+        if torch.distributed.get_world_size() == 1 and not self.zero_optimization():
+            # adds overhead to the iteration time
+            self.enable_backward_allreduce = False
+
         if mpu is not None:
             assert not self.elasticity_enabled(), (
                 "Elasticity is not currently supported" " with model parallelism."
@@ -266,11 +276,39 @@ class DeepSpeedEngine(Module):
         # Configure wall clock timers
         self.timers = SynchronizedWallClockTimer()
         # Throughput timer
+        if self.use_hpu or self.no_cuda:
+            synchronize_fn = None
+        else:
+            synchronize_fn = torch.cuda.synchronize
+
+        class MemInfo:
+            peak_ = 0
+
+            @classmethod
+            def get(cls):
+                if self.use_hpu:
+                    from habana_frameworks.torch.hpu import memory
+                    used = memory.memory_allocated()
+                    peak = memory.max_memory_allocated()
+                elif self.no_cuda:
+                    import os, psutil
+                    process = psutil.Process(os.getpid())
+                    used = process.memory_info().rss
+                    if used > cls.peak_:
+                        cls.peak_ = used
+                    peak = cls.peak_
+                else:
+                    used = torch.cuda.memory_allocated()
+                    peak = torch.cuda.max_memory_allocated()
+                return (used, peak)
+
         self.tput_timer = ThroughputTimer(
             batch_size=self.train_micro_batch_size_per_gpu(),
             num_workers=self.dp_world_size,
             steps_per_output=self.steps_per_print(),
             monitor_memory=False,
+            synchronize_fn=synchronize_fn,
+            mem_stats_fn=MemInfo.get
         )
 
         if dist.get_rank() == 0:
@@ -633,6 +671,9 @@ class DeepSpeedEngine(Module):
     def zero_allow_untested_optimizer(self):
         return self._config.zero_allow_untested_optimizer
 
+    def zero_allow_comm_data_type_fp32(self):
+        return self._config.zero_allow_comm_data_type_fp32
+
     def zero_reduce_scatter(self):
         return self._config.zero_config.reduce_scatter
 
@@ -656,6 +697,10 @@ class DeepSpeedEngine(Module):
 
     def zero_reduce_bucket_size(self):
         return self._config.zero_config.reduce_bucket_size
+
+    # TODO SW-97921: remove this WA code when SW-97305 is resolved
+    def max_group_size(self):
+        return self._config.zero_config.max_group_size
 
     def zero_allgather_bucket_size(self):
         return self._config.zero_config.allgather_bucket_size
@@ -725,7 +770,7 @@ class DeepSpeedEngine(Module):
         res = self._config.communication_data_type
         if res is not None:
             return res
-        elif self.fp16_enabled() or self.zero_optimization_stage():
+        elif self.fp16_enabled():
             return torch.float16
         elif self.bfloat16_enabled():
             return torch.bfloat16
@@ -829,14 +874,24 @@ class DeepSpeedEngine(Module):
             args,
             'device_rank') else self.local_rank
         if device_rank >= 0:
-            torch.cuda.set_device(device_rank)
-            self.device = torch.device("cuda", device_rank)
+            if args.use_hpu:
+                self.device = torch.device("hpu")
+            elif args.no_cuda:
+                self.device = torch.device("cpu")
+            else:
+                torch.cuda.set_device(device_rank)
+                self.device = torch.device("cuda", device_rank)
             self.world_size = dist.get_world_size()
             self.global_rank = dist.get_rank()
         else:
             self.world_size = 1
             self.global_rank = 0
-            self.device = torch.device("cuda")
+            if args.use_hpu:
+                self.device = torch.device("hpu")
+            elif args.no_cuda:
+                self.device = torch.device("cpu")
+            else:
+                self.device = torch.device("cuda")
 
     # Configure based on command line arguments
     def _configure_with_arguments(self, args, mpu):
@@ -1129,7 +1184,7 @@ class DeepSpeedEngine(Module):
             effective_adam_w_mode = self.optimizer_name(
             ) == ADAMW_OPTIMIZER or adam_w_mode
 
-            if torch_adam:
+            if torch_adam or self.use_hpu:
                 if not effective_adam_w_mode:
                     optimizer = torch.optim.Adam(model_parameters,
                                                  **optimizer_parameters)
@@ -1149,7 +1204,6 @@ class DeepSpeedEngine(Module):
                                                      adamw_mode=effective_adam_w_mode)
                 else:
                     from deepspeed.ops.adam import FusedAdam
-
                     optimizer = FusedAdam(
                         model_parameters,
                         **optimizer_parameters,
@@ -1284,7 +1338,13 @@ class DeepSpeedEngine(Module):
     def _configure_zero_optimizer(self, optimizer):
         zero_stage = self.zero_optimization_stage()
         log_dist('Creating fp16 ZeRO stage {} optimizer'.format(zero_stage), ranks=[0])
-        assert self.communication_data_type in (torch.float16, torch.bfloat16), "ZeRO supports only 'communication_data_type': ['fp16', 'bfp16']"
+
+        if self.zero_allow_comm_data_type_fp32() and self.communication_data_type == torch.float32:
+            log_dist('Using ZeRO with comm data type fp32', ranks=[0])
+        else:
+            assert self.communication_data_type in (torch.float16, torch.bfloat16), \
+                "ZeRO supports only 'communication_data_type': ['fp16', 'bfp16']"
+
         timers = self.timers if self.wall_clock_breakdown() else None
 
         if optimizer is None:
@@ -1323,6 +1383,8 @@ class DeepSpeedEngine(Module):
                 clip_grad=self.gradient_clipping(),
                 contiguous_gradients=contiguous_gradients,
                 reduce_bucket_size=self.zero_reduce_bucket_size(),
+                # TODO SW-97921: remove this WA code when SW-97305 is resolved
+                max_group_size=self.max_group_size(),
                 allgather_bucket_size=self.zero_allgather_bucket_size(),
                 dp_process_group=self.data_parallel_group,
                 expert_parallel_group=self.expert_parallel_group
@@ -1343,7 +1405,9 @@ class DeepSpeedEngine(Module):
                 fp16_master_weights_and_gradients=self.fp16_master_weights_and_gradients(
                 ),
                 communication_data_type=self.communication_data_type,
-                elastic_checkpoint=self.zero_elastic_checkpoint())
+                elastic_checkpoint=self.zero_elastic_checkpoint(),
+                use_hpu=self.use_hpu,
+                no_cuda=self.no_cuda)
 
         elif zero_stage == ZERO_OPTIMIZATION_WEIGHTS:
             assert not self.has_moe_layers, "MoE not supported with Stage 3"
@@ -1507,7 +1571,7 @@ class DeepSpeedEngine(Module):
 
         return scaled_loss
 
-    @instrument_w_nvtx
+    # @instrument_w_nvtx
     def forward(self, *inputs, **kwargs):
         r"""Execute forward propagation
         Arguments:
@@ -1603,7 +1667,7 @@ class DeepSpeedEngine(Module):
             f"rank={torch.distributed.get_rank()} time (ms) | forward: {fwd_time:.2f} (forward_moe: {moe_time:.2f}, 1st alltoall: {falltoall:.2f}, 2nd alltoall: {salltoall:.2f}, top-k: {gate_time:.2f})",
             ranks=[0])
 
-    @instrument_w_nvtx
+    # @instrument_w_nvtx
     def allreduce_gradients(self, bucket_size=MEMORY_OPT_ALLREDUCE_SIZE):
         # Pass (PP) gas boundary flag to optimizer (required for zero)
         self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary(
@@ -1621,7 +1685,7 @@ class DeepSpeedEngine(Module):
             else:
                 self.buffered_allreduce_fallback(elements_per_buffer=bucket_size)
 
-    @instrument_w_nvtx
+    # @instrument_w_nvtx
     def backward(self, loss, allreduce_gradients=True, release_loss=False):
         r"""Execute backward pass on the loss
 
@@ -2303,7 +2367,23 @@ class DeepSpeedEngine(Module):
                     moe_layer_id += 1
 
     def load_module_state_dict(self, state_dict, strict=True):
-        self.module.load_state_dict(state_dict, strict=strict)
+        #TODO SW-97199: remove this WA when SW-97151 is resolved
+        if self.use_hpu:
+            for key, param in self.module.named_parameters():
+                if key in state_dict:
+                    input_param = state_dict[key]
+                    try:
+                        with torch.no_grad():
+                            input_param = input_param.to('hpu')
+                            param.copy_(input_param)
+                    except Exception as ex:
+                        print('While copying the parameter named "{}", '
+                                        'whose dimensions in the model are {} and '
+                                        'whose dimensions in the checkpoint are {}, '
+                                        'an exception occurred : {}.'
+                                        .format(key, param.size(), input_param.size(), ex.args))
+        else:
+            self.module.load_state_dict(state_dict, strict=strict)
 
     def _get_rank_zero_ckpt_name(self, checkpoints_path, tag, mp_rank, dp_rank):
         filename = "zero_pp_rank_{}".format(dp_rank)
@@ -2921,7 +3001,7 @@ class DeepSpeedEngine(Module):
         state.update(client_state)
 
         log_dist(message=f'Saving model checkpoint: {save_path}', ranks=[0, 1])
-        torch.save(state, save_path)
+        save(state, save_path)
         self._curr_save_path = None
 
     def _get_buffer_names(self):
@@ -3003,7 +3083,7 @@ class DeepSpeedEngine(Module):
                        ds_config=self.config,
                        ds_version=version)
         with open(zero_checkpoint_name, 'wb') as fd:
-            torch.save(zero_sd, fd)
+            save(zero_sd, fd)
             fd.flush()
         if self.global_rank == 0:
             self._copy_recovery_script(save_path)
@@ -3125,3 +3205,20 @@ class DeepSpeedEngine(Module):
             torch.save(state_dict, path)
 
         return True
+
+def save(data, filename):
+    def convert_for_pickle(obj):
+        if isinstance(obj, dict):
+            return {k: convert_for_pickle(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_for_pickle(e) for e in obj]
+        elif isinstance(obj, tuple):
+            return tuple([convert_for_pickle(e) for e in obj])
+        else:
+            if isinstance(obj, torch.Tensor):
+                return obj.detach().cpu()
+            else:
+                return obj
+
+    data = convert_for_pickle(data)
+    torch.save(data, filename)

@@ -3,13 +3,15 @@ Copyright 2019 The Microsoft DeepSpeed Team
 '''
 
 import torch
+# TODO SW-97921: remove this WA code when SW-97305 is resolved
+import copy
 from torch.distributed.distributed_c10d import _get_global_rank
 import torch.distributed as dist
 from torch._six import inf
 from packaging import version as pkg_version
 
 from deepspeed.runtime.fp16.loss_scaler import LossScaler, DynamicLossScaler
-from deepspeed.runtime.utils import bwc_tensor_model_parallel_rank, get_global_norm, see_memory_usage, is_model_parallel_parameter
+from deepspeed.runtime.utils import bwc_tensor_model_parallel_rank, get_global_norm, see_memory_usage, is_model_parallel_parameter, typeof
 from deepspeed.runtime.zero.config import ZERO_OPTIMIZATION_GRADIENTS
 from deepspeed.runtime.zero.offload_constants import OFFLOAD_CPU_DEVICE, OFFLOAD_OPTIMIZER
 from deepspeed.ops.adam import DeepSpeedCPUAdam
@@ -35,14 +37,18 @@ def input(msg):
 
 def split_half_float_double(tensors):
     dtypes = [
-        "torch.cuda.HalfTensor",
-        "torch.cuda.FloatTensor",
-        "torch.cuda.DoubleTensor",
-        "torch.cuda.BFloat16Tensor"
+        torch.float16,
+        torch.float32,
+        torch.float64,
+        torch.bfloat16
     ]
+
+    for t in tensors:
+        assert typeof(t) in dtypes, f"attempting to reduce an unsupported grad type: {typeof(t)}"
+
     buckets = []
     for i, dtype in enumerate(dtypes):
-        bucket = [t for t in tensors if t.type() == dtype]
+        bucket = [t for t in tensors if typeof(t) == dtype]
         if bucket:
             buckets.append(bucket)
     return buckets
@@ -64,8 +70,10 @@ def get_alignment_padding(tensor_list, alignment):
 
 
 def move_to_cpu(tensor_list):
+    # TODO (SW-83491) This function must not be called until SW-80155 is resolved.
+    assert False, "This function must not be called until SW-80155 is resolved."
     for tensor in tensor_list:
-        tensor.data = tensor.data.cpu()
+        tensor.data = tensor.data.to("cpu")
 
 
 def print_rank_msg(msg):
@@ -101,6 +109,8 @@ class DeepSpeedZeroOptimizer(object):
                  verbose=True,
                  contiguous_gradients=True,
                  reduce_bucket_size=500000000,
+                 # TODO SW-97921: remove this WA code when SW-97305 is resolved
+                 max_group_size=4e9,
                  allgather_bucket_size=5000000000,
                  dp_process_group=None,
                  expert_parallel_group=None,
@@ -119,7 +129,9 @@ class DeepSpeedZeroOptimizer(object):
                  round_robin_gradients=False,
                  has_moe_layers=False,
                  fp16_master_weights_and_gradients=False,
-                 elastic_checkpoint=False):
+                 elastic_checkpoint=False,
+                 use_hpu=False,
+                 no_cuda=False):
 
         if dist.get_rank() == 0:
             logger.info(f"Reduce bucket size {reduce_bucket_size}")
@@ -159,7 +171,16 @@ class DeepSpeedZeroOptimizer(object):
 
         self.deepspeed_adam_offload = cpu_offload
 
-        self.device = torch.cuda.current_device() if not self.cpu_offload else 'cpu'
+        self.use_hpu = use_hpu
+
+        self.no_cuda = no_cuda
+
+        if use_hpu:
+            global habana_frameworks
+            import habana_frameworks
+            from habana_frameworks.torch import hpu as hpu
+
+        self.device = self.get_current_device()
 
         self.dp_process_group = dp_process_group
 
@@ -171,6 +192,11 @@ class DeepSpeedZeroOptimizer(object):
 
         #data parallel size for non-experts
         dp_size = dist.get_world_size(group=self.dp_process_group)
+
+        # TODO SW-97921: remove this WA code when SW-97305 is resolved
+        # reorder groups such that each group contains a max' of 4B elements
+        self.max_group_size = int(max_group_size)
+        self._reorder_optimizer_groups()
 
         #For MoE models this maybe different for different param group
         #It will be modified during MoE setup later in the init
@@ -212,7 +238,7 @@ class DeepSpeedZeroOptimizer(object):
         if self.fp16_master_weights_and_gradients:
             assert self.cpu_offload and type(self.optimizer) in [DeepSpeedCPUAdam], f"fp16_master_and_gradients requires optimizer to support keeping fp16 master and gradients while keeping the optimizer states in fp32. Currently only supported using ZeRO-Offload with DeepSpeedCPUAdam. But current setting is ZeRO-Offload:{self.cpu_offload} and optimizer type {type(self.optimizer)}. Either disable fp16_master_weights_and_gradients or enable ZeRO-2 Offload with DeepSpeedCPUAdam"
 
-        if self.reduce_scatter:
+        if self.reduce_scatter and self.partition_gradients:
             assert self.communication_data_type in (torch.float16, torch.bfloat16), f"ZeRO-2 supports only float16 or bfloat16 communication_data_type with reduce scatter enabled. Got: '{self.communication_data_type}'"
             assert self.gradient_predivide_factor == 1.0, "gradient_predivide_factor != 1.0 is not yet supported with ZeRO-2 with reduce scatter enabled"
             assert self.postscale_gradients, "pre-scale gradients is not yet supported with ZeRO-2 with reduce scatter enabled"
@@ -220,6 +246,7 @@ class DeepSpeedZeroOptimizer(object):
         # param flattened by groups
         self.bit16_groups = []
         self.bit16_groups_flat = []
+        self.bit16_groups_cpu = []
 
         # param partitioned by data parallel degree
         # this will contain a list of equal sized tensors
@@ -246,8 +273,9 @@ class DeepSpeedZeroOptimizer(object):
         # number of elements per partition in each group
         self.partition_size = []
 
-        #align nccl all-gather send buffers to 4-bye boundary
-        self.nccl_start_alignment_factor = 2  # 4-byte alignment/sizeof(fp16) = 2
+        # align nccl all-gather send buffers to 4-byte boundary
+        # e.g., for bfp16/fp16 4-byte alignment/sizeof(fp16) = 2
+        self.nccl_start_alignment_factor = int(4 / self.optimizer.param_groups[0]['params'][0].element_size())
 
         assert (allgather_bucket_size % self.nccl_start_alignment_factor == 0), f"allgather_bucket_size must be a multiple of nccl_start_alignment_factor, {self.nccl_start_alignment_factor} "
 
@@ -255,6 +283,7 @@ class DeepSpeedZeroOptimizer(object):
         self.dtype = self.optimizer.param_groups[0]['params'][0].dtype
 
         self.round_robin_bit16_groups = []
+        self.round_robin_bit16_groups_cpu = []
         self.round_robin_bit16_indices = []
 
         # Use different parallel to do all_to_all_reduce related things
@@ -285,7 +314,17 @@ class DeepSpeedZeroOptimizer(object):
 
             see_memory_usage(f"Before moving param group {i} to CPU")
             # move all the parameters to cpu to free up GPU space for creating flat buffer
-            move_to_cpu(self.bit16_groups[i])
+
+            # Create temp CPU param copies and free HPU tensors
+            # TODO (SW-80155) Remove this WA when solved.
+            bit16_groups_cpu = []
+            for param in self.bit16_groups[i]:
+                param_cpu = param.to("cpu")
+                bit16_groups_cpu.append(param_cpu)
+                param.data = torch.empty(1).to(self.device)
+            self.bit16_groups_cpu.append(bit16_groups_cpu)
+
+            #move_to_cpu(self.bit16_groups[i])
             see_memory_usage(f"After moving param group {i} to CPU", force=False)
 
             # Reorder group parameters for load balancing of gradient partitioning during backward among ranks.
@@ -297,20 +336,38 @@ class DeepSpeedZeroOptimizer(object):
                     self.bit16_groups[i],
                     dist.get_world_size(group=self.real_dp_process_group[i])
                 )
+                round_robin_tensors_cpu, _ = self._round_robin_reorder(
+                    self.bit16_groups_cpu[i],
+                    dist.get_world_size(group=self.real_dp_process_group[i])
+                )
             else:
                 round_robin_tensors = self.bit16_groups[i]
+                round_robin_tensors_cpu = self.bit16_groups_cpu[i]
                 round_robin_indices = list(range(len(self.bit16_groups[i])))
 
             self.round_robin_bit16_groups.append(round_robin_tensors)
+            self.round_robin_bit16_groups_cpu.append(round_robin_tensors_cpu)
             self.round_robin_bit16_indices.append(round_robin_indices)
 
-            # create flat buffer in CPU and move to GPU
-            self.bit16_groups_flat.append(
-                self.flatten_dense_tensors_aligned(
-                    self.round_robin_bit16_groups[i],
-                    self.nccl_start_alignment_factor *
-                    dist.get_world_size(group=self.real_dp_process_group[i])).cuda(
-                        torch.cuda.current_device()))
+            # create flat buffer in CPU and move it to the device
+            flattened_buffer = self.flatten_dense_tensors_aligned(
+                self.round_robin_bit16_groups_cpu[i],
+                self.nccl_start_alignment_factor *
+                dist.get_world_size(group=self.real_dp_process_group[i]))
+
+            # free temp CPU params, just keep the sizes
+            param_sizes = []
+            for param in bit16_groups_cpu:
+                param_sizes.append(param.size())
+                param.data = torch.empty(0)
+
+            self.bit16_groups_flat.append(flattened_buffer.to(self.device))
+            flattened_buffer.data = torch.empty(0)
+
+            # recover temp CPU params
+            for size, param in zip(param_sizes, bit16_groups_cpu):
+                param.data = torch.empty(size)
+
             see_memory_usage(f"After flattening and moving param group {i} to GPU",
                              force=False)
 
@@ -320,7 +377,11 @@ class DeepSpeedZeroOptimizer(object):
                     force=False)
 
             # set model bit16 weight to slices of flattened buffer
-            self._update_model_bit16_weights(i)
+            self._update_model_bit16_weights(i, group_cpu=True)
+
+            # Recover memory from temp CPU tensors
+            for param in self.bit16_groups_cpu[i]:
+                param.data = torch.empty(0)
 
             # divide the flat weights into near equal partition equal to the data parallel degree
             # each process will compute on a different part of the partition
@@ -330,14 +391,25 @@ class DeepSpeedZeroOptimizer(object):
             self.parallel_partitioned_bit16_groups.append(data_parallel_partitions)
 
             # verify that data partition start locations are 4-byte aligned
-            for partitioned_data in data_parallel_partitions:
-                assert (partitioned_data.data_ptr() %
-                        (2 * self.nccl_start_alignment_factor) == 0)
+            # TODO SW-80473 - enable once confirmed.
+            # def get_data_ptr(tensor):
+            #     if self.with_hpu:
+            #         import habana_frameworks.torch.core as ht
+            #         return ht.data_ptr(tensor)
+            #     return partitioned_data.data_ptr()
+            #
+            # if self.with_hpu:
+            #     import habana_frameworks.torch.core as ht
+            #     ht.mark_step()
 
-            # verify that data partition start locations are 4-byte aligned
-            for partitioned_data in data_parallel_partitions:
-                assert (partitioned_data.data_ptr() %
-                        (2 * self.nccl_start_alignment_factor) == 0)
+            # for partitioned_data in data_parallel_partitions:
+            #     assert (get_data_ptr(partitioned_data) %
+            #             (2 * self.nccl_start_alignment_factor) == 0)
+            #
+            # # verify that data partition start locations are 4-byte aligned
+            # for partitioned_data in data_parallel_partitions:
+            #     assert (get_data_ptr(partitioned_data) %
+            #             (2 * self.nccl_start_alignment_factor) == 0)
 
             # a partition of the fp32 master weights that will be updated by this process
             if not fp16_master_weights_and_gradients:
@@ -366,20 +438,23 @@ class DeepSpeedZeroOptimizer(object):
             self.params_not_in_partition.append(params_not_in_partition)
             self.first_offset.append(first_offset)
 
+        self.bit16_groups_cpu = []
+        self.round_robin_bit16_groups_cpu = []
+
         for rank in range(dist.get_world_size()):
             if dist.get_rank() == rank:
                 print(
                     f"Rank: {rank} partition count {self.partition_count} and sizes{[(p.numel(), self.is_moe_param_group[i] if hasattr(self, 'is_moe_param_group') else False) for i,p in enumerate(self.single_partition_of_fp32_groups)]} "
                 )
                 dist.barrier()
-        #exit(0)
+
         self.reduce_bucket_size = int(reduce_bucket_size)
         self.allgather_bucket_size = int(allgather_bucket_size)
 
-        self.reduction_event = torch.cuda.Event(enable_timing=False, blocking=False)
-        self.reduction_stream = torch.cuda.Stream()
-        self.cpu_computation_stream = torch.cuda.Stream()
-        self.copy_grad_stream = torch.cuda.Stream()
+        #self.reduction_event = None if self.use_hpu else torch.cuda.Event(enable_timing=False, blocking=False)
+        self.reduction_stream = self.create_stream()
+        self.cpu_computation_stream = self.create_stream()
+        self.copy_grad_stream = self.create_stream()
         self.callback_queued = False
 
         self.param_dict = {}
@@ -430,7 +505,7 @@ class DeepSpeedZeroOptimizer(object):
                 dtype=self.dtype).pin_memory()
             self.temp_grad_buffer_for_gpu_offload = torch.zeros(
                 largest_param_numel,
-                device=torch.cuda.current_device(),
+                device=self.get_current_device(),
                 dtype=self.dtype)
             for i, params_group in enumerate(self.bit16_groups):
                 self.get_grad_position(i,
@@ -492,15 +567,58 @@ class DeepSpeedZeroOptimizer(object):
 
             self.dynamic_loss_scale = True
 
-        see_memory_usage("Before initializing optimizer states", force=True)
+        # TODO SW-83502 - add support for HPU mem monitor
+        if torch.cuda.is_available():
+            see_memory_usage("Before initializing optimizer states", force=True)
         self.initialize_optimizer_states()
-        see_memory_usage("After initializing optimizer states", force=True)
+        # TODO SW-83502 - add support for HPU mem monitor
+        if torch.cuda.is_available():
+            see_memory_usage("After initializing optimizer states", force=True)
 
         if dist.get_rank() == 0:
             logger.info(f"optimizer state initialized")
 
         if dist.get_rank(group=self.dp_process_group) == 0:
-            see_memory_usage(f"After initializing ZeRO optimizer", force=True)
+            # TODO SW-83502 - add support for HPU mem monitor
+            if torch.cuda.is_available():
+                see_memory_usage(f"After initializing ZeRO optimizer", force=True)
+
+    def get_stream(self, stream):
+        assert self.use_hpu or not self.no_cuda, "get_stream only supported for hpu or cuda devices"
+        if self.use_hpu:
+            return habana_frameworks.torch.hpu.stream(stream)
+        elif not self.no_cuda:
+            return torch.cuda.stream(stream)
+
+    def create_stream(self):
+        assert self.use_hpu or not self.no_cuda, "create_stream only supported for hpu or cuda devices"
+        if self.use_hpu:
+            return habana_frameworks.torch.hpu.Stream()
+        elif not self.no_cuda:
+            return torch.cuda.Stream()
+
+    def get_current_stream(self):
+        assert self.use_hpu or not self.no_cuda, "get_stream only supported for hpu or cuda devices"
+        if self.use_hpu:
+            return habana_frameworks.torch.hpu.current_stream()
+        elif not self.no_cuda:
+            return torch.cuda.current_stream()
+
+    def get_current_device(self):
+        if self.use_hpu:
+            device_str = 'hpu:' + str(habana_frameworks.torch.hpu.current_device())
+        elif not self.no_cuda:
+            device_str = 'cuda:' + str(torch.cuda.current_device())
+        else:
+            device_str = 'cpu'
+        return torch.device(device_str)
+
+    def synchronize_device(self):
+        assert self.use_hpu or not self.no_cuda, "synchronize_device only supported for hpu or cuda devices"
+        if self.use_hpu:
+            habana_frameworks.torch.hpu.synchronize()
+        elif not self.no_cuda:
+            torch.cuda.synchronize()
 
     def is_moe_group(self, group):
         return 'moe' in group and group['moe']
@@ -525,8 +643,9 @@ class DeepSpeedZeroOptimizer(object):
         assert self.expert_dp_process_group is not None, "Expert data parallel group should be configured with MoE"
         assert self.ep_process_group is not None, "Expert parallel group should be configured with MoE"
 
-    def _update_model_bit16_weights(self, group_index):
+    def _update_model_bit16_weights(self, group_index, group_cpu=False):
         updated_params = self.unflatten(self.bit16_groups_flat[group_index],
+                                        self.round_robin_bit16_groups_cpu[group_index] if group_cpu else \
                                         self.round_robin_bit16_groups[group_index])
         for p, q in zip(self.round_robin_bit16_groups[group_index], updated_params):
             p.data = q.data
@@ -558,6 +677,38 @@ class DeepSpeedZeroOptimizer(object):
                 reordered_tensors.append(tensor)
 
         return reordered_tensors, reordered_indices
+
+    # TODO SW-97921: remove this WA code when SW-97305 is resolved
+    def _reorder_optimizer_groups(self):
+        new_grouped_parameters = []
+        for group in self.optimizer.param_groups:
+            template_group = {}
+            for key, value in group.items():
+                if key == "params":
+                    continue
+                template_group[key] = value
+            template_group['params'] = []
+            new_group = copy.deepcopy(template_group)
+            new_group_size = 0
+            for param in group['params']:
+                curr_param_size = torch.numel(param)
+                assert curr_param_size <= self.max_group_size, \
+                    f'one optimizer parameter has a size of {curr_param_size} bytes, which is greater \
+                    than {self.max_group_size} bytes! can not handle such tensor'
+
+                if new_group_size + curr_param_size <= self.max_group_size:
+                    new_group['params'].append(param)
+                    new_group_size += curr_param_size
+                else:
+                    new_grouped_parameters.append(new_group)
+                    new_group = copy.deepcopy(template_group)
+                    new_group['params'].append(param)
+                    new_group_size = curr_param_size
+            if len(new_group['params']) > 0:
+                new_grouped_parameters.append(new_group)
+
+        self.optimizer.param_groups = None
+        self.optimizer.param_groups = new_grouped_parameters
 
     def _release_ipg_buffers(self):
         if self.contiguous_gradients:
@@ -596,7 +747,7 @@ class DeepSpeedZeroOptimizer(object):
             self.ipg_buffer = []
             buf_0 = torch.empty(int(self.reduce_bucket_size),
                                 dtype=self.dtype,
-                                device=torch.cuda.current_device())
+                                device=self.get_current_device())
             self.ipg_buffer.append(buf_0)
             self.ipg_index = 0
 
@@ -657,7 +808,7 @@ class DeepSpeedZeroOptimizer(object):
             self.params_already_reduced[i] = False
 
         if self.overlap_comm:
-            torch.cuda.synchronize()
+            self.synchronize_device()
             # It is safe to clear previously reduced grads of other partitions
             self._clear_previous_reduced_grads()
 
@@ -670,14 +821,14 @@ class DeepSpeedZeroOptimizer(object):
                         self.first_offset[i],
                         self.partition_size[i],
                         dtype=self.dtype,
-                        device=torch.cuda.current_device(),
+                        device=self.device,
                         return_tensor_list=True)
                 else:
                     avg_new = self.get_flat_partition(self.params_in_partition[i],
                                                       self.first_offset[i],
                                                       self.partition_size[i],
                                                       dtype=self.dtype,
-                                                      device=torch.cuda.current_device(),
+                                                      device=self.get_current_device(),
                                                       return_tensor_list=True)
 
                     for accumulated_grad, new_avg_grad in zip(self.averaged_gradients[i], avg_new):
@@ -883,12 +1034,12 @@ class DeepSpeedZeroOptimizer(object):
 
     def average_tensor(self, tensor):
         if self.overlap_comm:
-            torch.cuda.synchronize()
+            self.synchronize_device()
             stream = self.reduction_stream
         else:
-            stream = torch.cuda.current_stream()
+            stream = self.get_current_stream()
 
-        with torch.cuda.stream(stream):
+        with self.get_stream(stream):
             if not self.reduce_scatter:
                 self.gradient_reduction_w_predivide(tensor)
                 return
@@ -962,15 +1113,17 @@ class DeepSpeedZeroOptimizer(object):
                 #     print(f"Rank {dist.get_rank()} rank offset id {i} real dp size {dist.get_world_size(group=real_dp_process_group[i])} and dst: {dst}")
                 # dist.barrier()
                 #dist.barrier()
-                dst_rank = _get_global_rank(real_dp_process_group[i], dst)
-                async_handle = dist.reduce(grad_slice,
-                                           dst=dst_rank,
+
+                #[SW-98008] WA for slow reduce. revert when reduce is optimized
+                #dst_rank = _get_global_rank(real_dp_process_group[i], dst)
+                async_handle = dist.all_reduce(grad_slice,
                                            group=real_dp_process_group[i],
                                            async_op=True)
                 async_handles.append(async_handle)
 
-            for handle in async_handles:
-                handle.wait()
+            if self.device.type != 'hpu':
+                for handle in async_handles:
+                    handle.wait()
 
     ##############################################################################
     ############################# CPU Offload Methods#############################
@@ -1142,7 +1295,7 @@ class DeepSpeedZeroOptimizer(object):
                     """
 
         # Sum across all model parallel GPUs.
-        total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
+        total_norm_cuda = torch.FloatTensor([float(total_norm)]).to(self.device)
         torch.distributed.all_reduce(total_norm_cuda,
                                      op=torch.distributed.ReduceOp.SUM,
                                      group=self.dp_process_group)
@@ -1184,7 +1337,7 @@ class DeepSpeedZeroOptimizer(object):
             see_memory_usage(f"before copying {total_size} gradients into partition")
             self.grads_in_partition = torch.empty(int(total_size),
                                                   dtype=self.dtype,
-                                                  device=torch.cuda.current_device())
+                                                  device=self.device)
             see_memory_usage(f"after copying {total_size} gradients into partition")
 
         # The allreduce buffer will be rewritten. Copy the gradients in partition to a new buffer
@@ -1192,7 +1345,12 @@ class DeepSpeedZeroOptimizer(object):
             0,
             self.grads_in_partition_offset,
             param.numel())
-        new_grad_tensor.copy_(param.grad.view(-1))
+        # TODO SW-98684 remove this workaround
+        # WA deepspeed not creating data dependency between bucket buffers. Make copy_ graph be a producer of bucket 
+        # tensor so pt bridge will register it as a producer in order to prevent the next bwd graph run on the compute 
+        # stream before this operation completes on the reduction stream
+        modified_grad = param.grad.view(-1).add_(0)
+        new_grad_tensor.copy_(modified_grad)
         param.grad.data = new_grad_tensor.data.view_as(param.grad)
         #print(f"Grad norm after copy to contiguous_buffer {param.grad.data.norm()}")
         self.grads_in_partition_offset += param.numel()
@@ -1207,7 +1365,7 @@ class DeepSpeedZeroOptimizer(object):
                 self.average_tensor(self.extra_large_param_to_reduce.grad.view(-1))
                 self.extra_large_param_to_reduce = None
             else:
-                self.average_tensor(self.ipg_buffer[self.ipg_index])
+                self.average_tensor(self.ipg_buffer[self.ipg_index].narrow(0, 0, self.elements_in_ipg_bucket))
         else:
             self.buffered_reduce_fallback(
                 None,
@@ -1220,11 +1378,11 @@ class DeepSpeedZeroOptimizer(object):
             # TODO: copy_grad_stream is disabled because of race with reduce. This hurts perf and should be fixed.
             #            torch.cuda.synchronize()
             #            stream = self.copy_grad_stream
-            stream = torch.cuda.current_stream()
+            stream = self.get_current_stream()
         else:
-            stream = torch.cuda.current_stream()
+            stream = self.get_current_stream()
 
-        with torch.cuda.stream(stream):
+        with self.get_stream(stream):
             for _, param, param_id in self.params_in_ipg_bucket:
 
                 assert self.params_already_reduced[param_id] == False, \
@@ -1368,15 +1526,16 @@ class DeepSpeedZeroOptimizer(object):
     # if rank is specified do a reduction instead of an allreduce
     def allreduce_and_copy(self, small_bucket, rank=None, log=None):
         if self.overlap_comm:
-            torch.cuda.synchronize()
+            self.synchronize_device()
             # It is safe to clear the previously reduced grads of other partitions
             self._clear_previous_reduced_grads()
             stream = self.reduction_stream
         else:
-            stream = torch.cuda.current_stream()
+            stream = self.get_current_stream()
 
-        with torch.cuda.stream(stream):
-            allreduced = self.allreduce_bucket(small_bucket, rank=rank, log=log)
+        with self.get_stream(stream):
+            allreduced = self.allreduce_bucket(small_bucket, rank=rank, log=log,
+                communication_data_type=self.communication_data_type)
             if rank is None or rank == dist.get_rank(group=self.dp_process_group):
                 for buf, synced in zip(small_bucket, self.unflatten(allreduced, small_bucket)):
                     buf.copy_(synced)
@@ -1515,7 +1674,7 @@ class DeepSpeedZeroOptimizer(object):
         norm_type = float(norm_type)
         if norm_type == inf:
             total_norm = max(g.data.abs().max() for g in gradients)
-            total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
+            total_norm_cuda = torch.FloatTensor([float(total_norm)]).to(self.device)
             torch.distributed.all_reduce(total_norm_cuda,
                                          op=torch.distributed.ReduceOp.MAX,
                                          group=self.dp_process_group)
@@ -1535,8 +1694,8 @@ class DeepSpeedZeroOptimizer(object):
                 if is_model_parallel_parameter(p) or (self.model_parallel_rank == 0):
                     param_norm = g.data.double().norm(2)
                     total_norm += param_norm.item()**2
-            # Sum across all model parallel GPUs.
-            total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
+            # Sum across all model parallel Device.
+            total_norm_cuda = torch.FloatTensor([float(total_norm)]).to(self.device)
             torch.distributed.all_reduce(total_norm_cuda,
                                          op=torch.distributed.ReduceOp.SUM,
                                          group=self.dp_process_group)
@@ -1777,15 +1936,18 @@ class DeepSpeedZeroOptimizer(object):
                     ) - shard_id * shard_size
 
                 shard_list = []
-                for dp_id in range(dp_world_size):
-                    curr_shard = partitioned_params[dp_id].narrow(
-                        0,
-                        shard_id * shard_size,
-                        num_elements).detach()
-                    shard_list.append(curr_shard)
-                dist.all_gather(shard_list,
-                                shard_list[partition_id],
-                                group=self.real_dp_process_group[group_id])
+                with torch.no_grad():
+                    for dp_id in range(dp_world_size):
+                        curr_shard = partitioned_params[dp_id].narrow(
+                            0,
+                            shard_id * shard_size,
+                            num_elements)
+                        shard_list.append(curr_shard)
+
+                    dist.all_gather(shard_list,
+                                    shard_list[partition_id],
+                                    group=self.real_dp_process_group[group_id],
+                                    async_op= True if self.device=='hpu' else False)
         self.stop_timers([OPTIMIZER_ALLGATHER])
 
         # TODO: we probably don't need this? just to be safe
@@ -1836,6 +1998,18 @@ class DeepSpeedZeroOptimizer(object):
 
         return False
 
+    # `params` is a list / generator of torch.Variable
+    def has_overflow_serial_hpu(self, params):
+        invalid_grad_count = torch.zeros([1], dtype=torch.float, device = self.device)
+        for p in params:
+            if p.grad is not None:
+                float_grad = p.grad.float()
+                nan = float_grad.isnan()
+                inf = float_grad.isinf()
+                inf_or_nan = nan.logical_or(inf)
+                invalid_grad_count += inf_or_nan.float().max()
+        return invalid_grad_count
+
     def has_overflow_partitioned_grads_serial(self):
         for i in range(len(self.bit16_groups)):
             for j, grad in enumerate(self.averaged_gradients[i]):
@@ -1843,11 +2017,27 @@ class DeepSpeedZeroOptimizer(object):
                     return True
         return False
 
+    def has_overflow_partitioned_grads_serial_hpu(self):
+        invalid_grad_count = torch.zeros([1], dtype=torch.float, device = self.device)
+        for i in range(len(self.bit16_groups)):
+            for j, grad in enumerate(self.averaged_gradients[i]):
+                if grad is not None:
+                    float_grad = grad.float()
+                    nan = float_grad.isnan()
+                    inf = float_grad.isinf()
+                    inf_or_nan = nan.logical_or(inf)
+                    invalid_grad_count += inf_or_nan.float().max()
+        return invalid_grad_count
+
     def has_overflow(self, partition_gradients=True):
         if partition_gradients:
-            overflow = self.local_overflow if self.cpu_offload else self.has_overflow_partitioned_grads_serial(
-            )
-            overflow_gpu = torch.cuda.ByteTensor([overflow])
+            if self.device.type == 'hpu':
+                overflow = self.local_overflow if self.cpu_offload else self.has_overflow_partitioned_grads_serial_hpu()
+                overflow_gpu = overflow.to(self.device)
+            else:
+                overflow = self.local_overflow if self.cpu_offload else self.has_overflow_partitioned_grads_serial(
+                )
+                overflow_gpu = torch.ByteTensor([overflow]).to(self.device)
             '''This will capture overflow across all data parallel and expert parallel process
             Since expert parallel process are a subset of data parallel process'''
             torch.distributed.all_reduce(overflow_gpu,
@@ -1859,9 +2049,11 @@ class DeepSpeedZeroOptimizer(object):
             for group in self.bit16_groups:
                 for param in group:
                     params.append(param)
-
-            overflow = self.has_overflow_serial(params, is_grad_list=partition_gradients)
-            overflow_gpu = torch.cuda.ByteTensor([overflow])
+            if self.device.type == 'hpu':
+                overflow_gpu = self.has_overflow_serial_hpu(params)
+            else:
+                overflow = self.has_overflow_serial(params, is_grad_list=partition_gradients)
+                overflow_gpu = torch.cuda.ByteTensor([overflow])
 
         # Since each model parallel GPU carries only part of the model,
         # make sure overflow flag is synced across all the model parallel GPUs
@@ -1874,6 +2066,7 @@ class DeepSpeedZeroOptimizer(object):
     # `x` is a torch.Tensor
     @staticmethod
     def _has_inf_or_nan(x, j=None):
+        assert x.device.type != 'hpu', "_has_inf_or_nan not optimized for hpu device"
         try:
             # if x is half, the .float() incurs an additional deep copy, but it's necessary if
             # Pytorch's .sum() creates a one-element tensor of the same type as x
@@ -1907,14 +2100,14 @@ class DeepSpeedZeroOptimizer(object):
             self.ipg_buffer = []
             buf_0 = torch.empty(int(self.reduce_bucket_size),
                                 dtype=self.dtype,
-                                device=torch.cuda.current_device())
+                                device=self.device)
             self.ipg_buffer.append(buf_0)
 
             # Use double buffers to avoid data access conflict when overlap_comm is enabled.
             if self.overlap_comm:
                 buf_1 = torch.empty(int(self.reduce_bucket_size),
                                     dtype=self.dtype,
-                                    device=torch.cuda.current_device())
+                                    device=self.device)
                 self.ipg_buffer.append(buf_1)
             self.ipg_index = 0
 
@@ -2213,7 +2406,10 @@ class DeepSpeedZeroOptimizer(object):
                 # For non-elastic checkpoint, simply copying from saved weights of current rank is sufficient.
                 for current, saved in zip(self.single_partition_of_fp32_groups, current_rank_sd[SINGLE_PARTITION_OF_FP32_GROUPS]):
                     src_tensor = _get_padded_tensor(saved, current.numel())
-                    current.data.copy_(src_tensor.data)
+                    if self.use_hpu:
+                        current.data.copy_(src_tensor.to('hpu').data)
+                    else:
+                        current.data.copy_(src_tensor.data)
         else:
             # option 1 from above
             self._restore_from_bit16_weights()
