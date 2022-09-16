@@ -390,7 +390,8 @@ class ValidationMode:
 # "checkpoint": {tag_validation=["Ignore"|"Warn"|"Fail"]}
 CHECKPOINT = "checkpoint"
 CHECKPOINT_TAG_VALIDATION = "tag_validation"
-CHECKPOINT_TAG_VALIDATION_DEFAULT = ValidationMode.WARN
+# TODO: SW-96286 - restore default value to WARN
+CHECKPOINT_TAG_VALIDATION_DEFAULT = ValidationMode.IGNORE
 CHECKPOINT_TAG_VALIDATION_MODES = [
     ValidationMode.WARN,
     ValidationMode.IGNORE,
@@ -446,3 +447,12 @@ The last incomplete batch can be dropped by setting:
 '''
 DATALOADER_DROP_LAST = "dataloader_drop_last"
 DATALOADER_DROP_LAST_DEFAULT = False
+
+#############################################
+# Allow FP32 for ZeRO1
+#############################################
+# By default, ZeRO does not support FP32 comm data type.
+# The reason is that it has less gain to use FP32 in ZeRO.
+# However, it may be useful for debugging to compare ZeRO to non-ZeRO FP32 runs.
+ZERO_ALLOW_COMM_DATA_TYPE_FP32 = "zero_allow_comm_data_type_fp32"
+ZERO_ALLOW_COMM_DATA_TYPE_FP32_DEFAULT = False

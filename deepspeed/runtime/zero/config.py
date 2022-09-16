@@ -19,6 +19,8 @@ class DeepSpeedZeroConfig(DeepSpeedConfigObject):
         self.contiguous_gradients = None
         self.reduce_scatter = None
         self.reduce_bucket_size = None
+        # TODO SW-97921: remove this WA code when SW-97305 is resolved
+        self.max_group_size = None
         self.allgather_partitions = None
         self.allgather_bucket_size = None
         self.overlap_comm = None
@@ -96,6 +98,12 @@ class DeepSpeedZeroConfig(DeepSpeedConfigObject):
             zero_config_dict,
             ZERO_OPTIMIZATION_REDUCE_BUCKET_SIZE,
             ZERO_OPTIMIZATION_REDUCE_BUCKET_SIZE_DEFAULT)
+
+        # TODO SW-97921: remove this WA code when SW-97305 is resolved
+        self.max_group_size = get_scalar_param(
+            zero_config_dict,
+            ZERO_OPTIMIZATION_MAX_GROUP_SIZE,
+            ZERO_OPTIMIZATION_MAX_GROUP_SIZE_DEFAULT)
 
         self.reduce_scatter = get_scalar_param(zero_config_dict,
                                                ZERO_OPTIMIZATION_REDUCE_SCATTER,

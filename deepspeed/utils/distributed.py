@@ -18,7 +18,7 @@ def init_distributed(dist_backend="nccl",
     """Initialize torch.distributed backend, potentially performing MPI discovery if needed
 
     Arguments:
-        dist_backend: Optional (str). torch distributed backend, e.g., nccl, mpi, gloo
+        dist_backend: Optional (str). torch distributed backend, e.g., nccl, mpi, gloo, hccl
 
         auto_mpi_discovery Optional (bool). if distributed environment variables are not set, attempt to discover them from MPI
 
@@ -46,6 +46,8 @@ def init_distributed(dist_backend="nccl",
             logger.info(
                 "Initializing torch distributed with backend: {}".format(dist_backend))
         assert isinstance(timeout, timedelta)
+        if dist_backend == "hccl":
+            import habana_frameworks.torch.distributed.hccl
         torch.distributed.init_process_group(backend=dist_backend,
                                              timeout=timeout,
                                              init_method=init_method)

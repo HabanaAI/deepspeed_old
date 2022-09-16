@@ -128,6 +128,8 @@ class ThroughputTimer:
         steps_per_output=50,
         monitor_memory=False,
         logging_fn=None,
+        synchronize_fn=torch.cuda.synchronize,
+        mem_stats_fn=None
     ):
         self.start_time = 0
         self.end_time = 0
@@ -147,6 +149,8 @@ class ThroughputTimer:
         if self.logging is None:
             self.logging = logger.info
         self.initialized = False
+        self.synchronize_fn = synchronize_fn
+        self.mem_stats_fn = mem_stats_fn
 
         if self.monitor_memory and not PSUTILS_INSTALLED:
             raise ImportError("Unable to import 'psutils', please install package")
@@ -162,7 +166,8 @@ class ThroughputTimer:
         self._init_timer()
         self.started = True
         if self.total_step_count >= self.start_step:
-            torch.cuda.synchronize()
+            if self.synchronize_fn:
+                self.synchronize_fn()
             self.start_time = time.time()
 
     def stop(self, report_speed=True):
@@ -172,21 +177,23 @@ class ThroughputTimer:
         self.total_step_count += 1
         self.local_step_count += 1
         if self.total_step_count > self.start_step:
-            torch.cuda.synchronize()
+            if self.synchronize_fn:
+                self.synchronize_fn()
             self.end_time = time.time()
             duration = self.end_time - self.start_time
             self.total_elapsed_time += duration
             if self.local_step_count % self.steps_per_output == 0:
                 if report_speed:
+                    mem_stats = ""
+                    if self.mem_stats_fn is not None:
+                       (used, peak) = self.mem_stats_fn()
+                       mem_stats = f", MemAllocated={round(used/1024**3, 2)}GB, MaxMemAllocated={round(peak/1024**3, 2)}GB"
                     self.logging(
-                        "{}/{}, SamplesPerSec={}, MemAllocated={}GB, MaxMemAllocated={}GB"
+                        "{}/{}, SamplesPerSec={}{}"
                         .format(self.epoch_count,
                                 self.local_step_count,
                                 self.avg_samples_per_sec(),
-                                round(torch.cuda.memory_allocated() / 1024**3,
-                                      2),
-                                round(torch.cuda.max_memory_allocated() / 1024**3,
-                                      2)))
+                                mem_stats))
                 if self.monitor_memory:
                     virt_mem = psutil.virtual_memory()
                     swap = psutil.swap_memory()
