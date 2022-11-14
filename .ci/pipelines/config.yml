@@ -1,0 +1,4 @@
+config:
+  jobTimeout: '90'
+  gerritTriggerMap:
+  - repository: deepspeed-fork

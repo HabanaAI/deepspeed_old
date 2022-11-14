@@ -16,7 +16,7 @@ b886b7bb972afe72bac0f5de4f42a4a7bae8ebef
 import copy
 import torch
 import contextlib
-import torch.distributed as dist
+from deepspeed import comm as dist
 
 import mmap
 from torch import _C
@@ -58,7 +58,7 @@ PROFILE_TIME = False
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 transport_stream = None
-cuda_device = None
+device = None
 
 
 def detach_variable(inputs, device=None):
@@ -119,19 +119,40 @@ def _set_cuda_rng_state(new_state, device=-1):
     _lazy_call(cb)
 
 
-class CudaRNGStatesTracker:
-    """Tracker for the cuda RNG states.
+class RNGStatesTracker:
+    """Tracker for the device RNG states.
 
-    Using the `add` method, a cuda rng state is initialized based on
+    Using the `add` method, a device rng state is initialized based on
     the input `seed` and is assigned to `name`. Later, by forking the
     rng state, we can perform operations and return to our starting
-    cuda state.
+    device state.
     """
     def __init__(self):
-        # Map from a string name to the cuda rng state.
+
+        self.device_initialized = False
+        # Map from a string name to the device rng state.
         self.states_ = {}
         # Seeds are just for book keeping and ensure no seed is set twice.
         self.seeds_ = set()
+
+    def Device(self, device_type):
+        if not self.device_initialized:
+            # choose state functions according to device
+            if device_type == 'hpu':
+                import habana_frameworks.torch.hpu.random as hpu_random
+                self.get_state_fnc = hpu_random.get_rng_state
+                self.set_state_fnc = hpu_random.set_rng_state
+                self.manual_seed = hpu_random.manual_seed
+                self.set_rng_state = _set_hpu_rng_state
+
+            else:
+                self.get_state_fnc = torch.cuda.get_rng_state
+                self.set_state_fnc = torch.cuda.set_rng_state
+                self.manual_seed = torch.cuda.manual_seed
+                self.set_rng_state = _set_cuda_rng_state
+
+            self.device_initialized = True
+        return self
 
     def reset(self):
         """Set to the initial state (no tracker)."""
@@ -150,52 +171,111 @@ class CudaRNGStatesTracker:
 
     def add(self, name, seed):
         """Track the rng state."""
+        if not self.device_initialized:
+            raise Exception('RNGStatesTracker device is not initialized!')
         # Check seed is not already used.
         if seed in self.seeds_:
             raise Exception('seed {} already exists'.format(seed))
         self.seeds_.add(seed)
         # Check that state is not already defined.
         if name in self.states_:
-            raise Exception('cuda rng state {} already exists'.format(name))
+            raise Exception('device rng state {} already exists'.format(name))
         # Get the current rng state.
-        orig_rng_state = torch.cuda.get_rng_state()
+        orig_rng_state = self.get_state_fnc()
         # Set the new state and store it.
-        torch.cuda.manual_seed(seed)
-        self.states_[name] = torch.cuda.get_rng_state()
+        self.manual_seed(seed)
+        self.states_[name] = self.get_state_fnc()
         # Reset rng state to what it was.
-        _set_cuda_rng_state(orig_rng_state)
+        self.set_rng_state(orig_rng_state)
 
     @contextlib.contextmanager
     def fork(self, name=_MODEL_PARALLEL_RNG_TRACKER_NAME):
-        """Fork the cuda rng state, perform operations, and exit with
+        if not self.device_initialized:
+            raise Exception('RNGStatesTracker device is not initialized!')
+        """Fork the device rng state, perform operations, and exit with
         the original state."""
         # Check if we have added the state
         if name not in self.states_:
-            raise Exception('cuda rng state {} is not added'.format(name))
+            raise Exception('device rng state {} is not added'.format(name))
         # Store current rng state.
-        orig_cuda_rng_state = torch.cuda.get_rng_state()
+        orig_device_rng_state = self.get_state_fnc()
         # Set rng state to the desired one
-        _set_cuda_rng_state(self.states_[name])
+        self.set_rng_state(self.states_[name])
         # Do the stuff we wanted to do.
         try:
             yield
         finally:
             # Update the current rng state for later use.
-            self.states_[name] = torch.cuda.get_rng_state()
+            self.states_[name] = self.get_state_fnc()
             # And set the state to the original state we started with.
-            _set_cuda_rng_state(orig_cuda_rng_state)
+            self.set_rng_state(orig_device_rng_state)
 
+def get_device_rng_state(device):
+    state = {"torch_rng_state": torch.get_rng_state()}
+    if device.type == 'cuda':
+        state["cuda_rng_state"] = torch.cuda.get_rng_state()
+        state["cuda_rng_tracker_states"] = get_cuda_rng_tracker().get_states()
+    elif device.type == 'hpu':
+        import habana_frameworks.torch.hpu.random
+        state["hpu_rng_state"] = habana_frameworks.torch.hpu.random.get_rng_state(device)
+        state["hpu_rng_tracker_states"] = get_hpu_rng_tracker().get_states()
 
-# RNG tracker object.
-_CUDA_RNG_STATE_TRACKER = CudaRNGStatesTracker()
+    return state
 
+def set_device_rng_state(state, device):
+    torch.set_rng_state(state["torch_rng_state"])
+    if device.type == 'cuda':
+        torch.cuda.set_rng_state(state["cuda_rng_state"])
+        get_cuda_rng_tracker().set_states(state["cuda_rng_tracker_states"])
+    elif device.type == 'hpu':
+        import habana_frameworks.torch.hpu.random
+        habana_frameworks.torch.hpu.random.set_rng_state(state["hpu_rng_state"])
+        get_hpu_rng_tracker().set_states(state["hpu_rng_tracker_states"])
+
+def _set_hpu_rng_state(new_state, device=-1):
+    """Sets the random number generator state of the current HPU.
+
+    Arguments:
+        new_state (torch.ByteTensor): The desired state
+    This function is adapted from PyTorch repo (torch.set_rng_state)
+    with a single change: the input state is not cloned. Cloning caused
+    major performance issues for +4 HPU cases.
+    """
+    # newer PyTorch
+    if device == -1:
+        device = torch.device('hpu')
+    elif isinstance(device, str):
+        device = torch.device(device)
+    elif isinstance(device, int):
+        device = torch.device('hpu', device)
+
+    def cb():
+        idx = device.index
+        if idx is None:
+            idx = habana_frameworks.torch.hpu.current_device()
+        default_generator = habana_frameworks.torch.hpu.random.default_generators[idx]
+        default_generator.set_state(new_state)
+
+    _lazy_call(cb)
+
+_DEVICE_RNG_STATE_TRACKER = RNGStatesTracker()
+
+def get_hpu_rng_tracker():
+    """Get hpu rng tracker."""
+    return _DEVICE_RNG_STATE_TRACKER.Device('hpu')
 
 def get_cuda_rng_tracker():
     """Get cuda rng tracker."""
-    return _CUDA_RNG_STATE_TRACKER
+    return _DEVICE_RNG_STATE_TRACKER.Device('cuda')
 
+
+def model_parallel_hpu_manual_seed(seed):
+    return model_parallel_manual_seed(seed, 'hpu')
 
 def model_parallel_cuda_manual_seed(seed):
+    return model_parallel_manual_seed(seed, 'cuda')
+
+def model_parallel_manual_seed(seed, device_type):
     """Initialize model parallel cuda seed.
 
     This function should be called after the model parallel is
@@ -222,23 +302,32 @@ def model_parallel_cuda_manual_seed(seed):
     # Data parallel gets the original seed.
     data_parallel_seed = seed
 
-    if torch.distributed.get_rank() == 0:
+    if dist.get_rank() == 0:
         logger.info(
             '> initializing model parallel cuda seeds on global rank {}, '
             'model parallel rank {}, and data parallel rank {} with '
             'model parallel seed: {} and data parallel seed: {}'.format(
-                torch.distributed.get_rank(),
+                dist.get_rank(),
                 tp_rank,
                 mpu.get_data_parallel_rank(),
                 model_parallel_seed,
                 data_parallel_seed),
         )
-    _CUDA_RNG_STATE_TRACKER.reset()
-    # Set the default state.
-    torch.cuda.manual_seed(data_parallel_seed)
-    # and model parallel state.
-    _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, model_parallel_seed)
-
+    if (device_type=='cuda'):
+        get_cuda_rng_tracker().reset()
+        # Set the default state.
+        get_cuda_rng_tracker().manual_seed(data_parallel_seed)
+        # and model parallel state.
+        get_cuda_rng_tracker().add(_MODEL_PARALLEL_RNG_TRACKER_NAME, model_parallel_seed)
+    elif (device_type=='hpu'):
+        get_hpu_rng_tracker().reset()
+        # Set the default state.
+        get_hpu_rng_tracker().manual_seed(data_parallel_seed)
+        # and model parallel state.
+        get_hpu_rng_tracker().add(_MODEL_PARALLEL_RNG_TRACKER_NAME, model_parallel_seed)
+    else:
+        logger.fatal(f"Unknown device type {device_type} in model_parallel_manual_seed")
+ 
 
 def get_partition_start(item):
     global mp_rank, mp_size, mp_group
@@ -489,7 +578,6 @@ def get_cpu_activations_for_backward(args, inputs):
 
     return new_args
 
-
 class CheckpointFunction(torch.autograd.Function):
     """This function is adapted from torch.utils.checkpoint with
        two main changes:
@@ -511,7 +599,13 @@ class CheckpointFunction(torch.autograd.Function):
             ctx.tensor_flags = tensor_flags
 
         if SYNCHRONIZE:
-            torch.cuda.synchronize()
+            if args[0].device.type == 'hpu':
+                import habana_frameworks.torch as htorch
+                htorch.core.mark_step()
+                # TODO SW-93440: check if its nessicary to call synchronize
+                htorch.hpu.synchronize()
+            else:
+                torch.cuda.synchronize()
 
         if timers is None and PROFILE_TIME:
             timers = Timers()
@@ -539,9 +633,8 @@ class CheckpointFunction(torch.autograd.Function):
                 mp_size = 1
                 mp_group = None
 
-        global cuda_device, transport_stream, PARTITION_ACTIVATIONS, buffer_0, buffer_1, buffer_0_offset, buffer_1_offset
-
-        if cuda_device is None:
+        global device, transport_stream, PARTITION_ACTIVATIONS, buffer_0, buffer_1, buffer_0_offset, buffer_1_offset
+        if device is None:
             see_memory_usage("First Forward Beginning", force=False)
             if dist.get_rank() == 0:
                 logger.info(f"Activation Checkpointing Information")
@@ -554,8 +647,11 @@ class CheckpointFunction(torch.autograd.Function):
                 logger.info(f"----Synchronization {SYNCHRONIZE}")
                 logger.info(f"----Profiling time in checkpointing {PROFILE_TIME}")
 
-            cuda_device = torch.cuda.current_device()
-            transport_stream = torch.cuda.Stream(device=cuda_device)
+            # choose correct device
+            device = args[0].device
+
+            if device.type == 'cuda':
+                transport_stream = torch.cuda.Stream(device=device)
 
         if PARTITION_ACTIVATIONS:
             inputs = partition_activations(args,
@@ -568,13 +664,11 @@ class CheckpointFunction(torch.autograd.Function):
 
         # just in case something funky is happening such as reuse of inputs
         inputs_cuda = copy_to_device(args,
-                                     device=cuda_device,
+                                     device=device,
                                      criterion_func=is_activation_to_checkpoint)
 
         # Copy the rng states.
-        ctx.fwd_cpu_rng_state = torch.get_rng_state()
-        ctx.fwd_cuda_rng_state = torch.cuda.get_rng_state()
-        ctx.fwd_cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
+        ctx.fwd_rng_state = get_device_rng_state(device)
 
         see_memory_usage("Before running forward on the layer", force=False)
         # ctx.save_for_backward(*args)
@@ -601,7 +695,13 @@ class CheckpointFunction(torch.autograd.Function):
             timers('forward').stop()
             timers.log(['forward'])
         if SYNCHRONIZE:
-            torch.cuda.synchronize()
+            if device.type == 'hpu':
+                import habana_frameworks.torch as htorch
+                htorch.core.mark_step()
+                # TODO SW-93440: check if its nessicary to call synchronize
+                htorch.hpu.synchronize()
+            else:
+                torch.cuda.synchronize()
 
         # Tensors returned from forward() may not be differentiable.
         if torch.is_tensor(outputs):
@@ -627,8 +727,17 @@ class CheckpointFunction(torch.autograd.Function):
         # removing pointers to the contiguous buffer memory
         # so that they can be garbage collected once the checkpoints
         # have been used
+        if grads[0].device.type == 'hpu':
+            import habana_frameworks.torch as htorch
+            htorch.core.mark_step()
         if SYNCHRONIZE:
-            torch.cuda.synchronize()
+            if grads[0].device.type == 'hpu':
+                import habana_frameworks.torch as htorch
+                htorch.core.mark_step()
+                # TODO SW-93440: check if its nessicary to call synchronize
+                htorch.hpu.synchronize()
+            else:
+                torch.cuda.synchronize()
         if PROFILE_TIME:
             timers('backward').start()
 
@@ -651,17 +760,17 @@ class CheckpointFunction(torch.autograd.Function):
             raise RuntimeError("Checkpointing is not compatible with .grad(), "
                                "please use .backward() if possible")
 
-        global cuda_device, transport_stream, PARTITION_ACTIVATIONS
+        global device, transport_stream, PARTITION_ACTIVATIONS
 
         if PARTITION_ACTIVATIONS:
             # with torch.cuda.stream(transport_stream):
             inputs = gather_partitioned_activations(
                 ctx.deepspeed_saved_tensors,
-                device=cuda_device if CPU_CHECKPOINT else None)
+                device=device if CPU_CHECKPOINT else None)
             detached_inputs = detach_variable(inputs)
         elif CPU_CHECKPOINT:
             inputs = move_to_device(ctx.deepspeed_saved_tensors,
-                                    cuda_device,
+                                    device,
                                     is_activation_to_checkpoint)
             detached_inputs = detach_variable(inputs)
         else:
@@ -674,14 +783,10 @@ class CheckpointFunction(torch.autograd.Function):
                                         tensor_flags=ctx.tensor_flags)
 
         # Store the current states.
-        bwd_cpu_rng_state = torch.get_rng_state()
-        bwd_cuda_rng_state = torch.cuda.get_rng_state()
-        bwd_cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
+        bwd_rng_state = get_device_rng_state(device)
 
         # Set the states to what it used to be before the forward pass.
-        torch.set_rng_state(ctx.fwd_cpu_rng_state)
-        _set_cuda_rng_state(ctx.fwd_cuda_rng_state)
-        get_cuda_rng_tracker().set_states(ctx.fwd_cuda_rng_state_tracker)
+        set_device_rng_state(ctx.fwd_rng_state, device)
 
         # if PARTITION_ACTIVATIONS:
         #     current_stream=torch.cuda.current_stream()
@@ -694,9 +799,7 @@ class CheckpointFunction(torch.autograd.Function):
 
         see_memory_usage("In backward checkpointing code after forward", force=False)
         # Set the states back to what it was at the start of this function.
-        torch.set_rng_state(bwd_cpu_rng_state)
-        _set_cuda_rng_state(bwd_cuda_rng_state)
-        get_cuda_rng_tracker().set_states(bwd_cuda_rng_state_tracker)
+        set_device_rng_state(bwd_rng_state, device)
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs, )
@@ -729,7 +832,13 @@ class CheckpointFunction(torch.autograd.Function):
             timers('backward').stop()
             timers.log(['backward'])
         if SYNCHRONIZE:
-            torch.cuda.synchronize()
+            if grads[0].device.type == 'hpu':
+                import habana_frameworks.torch as htorch
+                htorch.core.mark_step()
+                # TODO SW-93440: check if its nessicary to call synchronize
+                htorch.hpu.synchronize()
+            else:
+                torch.cuda.synchronize()
         ret_list = [None, None]  # first None for ctx
         for inp in detached_inputs:
             if torch.is_tensor(inp):
