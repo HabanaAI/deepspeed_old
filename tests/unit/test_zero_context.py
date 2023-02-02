@@ -6,8 +6,9 @@ import pytest
 
 import deepspeed
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus, partitioned_param_data_shape
+import deepspeed.comm as dist
 
-from .common import distributed_test, get_master_port
+from .common import distributed_test, get_master_port, is_hpu_supported
 
 
 def setup_serial_env():
@@ -19,13 +20,15 @@ def setup_serial_env():
     os.environ['WORLD_SIZE'] = '1'
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-101073")
 def test_scattered_init_dist():
     setup_serial_env()
-    assert not torch.distributed.is_initialized()
+    assert not dist.is_initialized()
     with deepspeed.zero.Init():
-        assert torch.distributed.is_initialized()
+        assert dist.is_initialized()
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-101073")
 @distributed_test(world_size=2)
 def test_scatter_gather():
     with deepspeed.zero.Init():
@@ -43,6 +46,7 @@ def test_scatter_gather():
         assert l.weight.numel() == l.in_features * l.out_features
 
 
+@pytest.mark.skipif(pytest.use_hpu == True, reason="skip, due to SW-101073")
 @distributed_test(world_size=2)
 def test_gather_update():
     with deepspeed.zero.Init():
@@ -52,7 +56,7 @@ def test_gather_update():
     # Gather and make a change
     with deepspeed.zero.GatheredParameters(l.weight, modifier_rank=1):
         assert l.weight.ds_status == ZeroParamStatus.AVAILABLE
-        if torch.distributed.get_rank() == 1:
+        if dist.get_rank() == 1:
             with torch.no_grad():
                 l.weight.zero_()
 
@@ -103,8 +107,17 @@ def test_ext_param_getattr():
             return C.sum()
 
     net = ExtLinear()
-
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config["fp16"]["enabled"] = False
+            config["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = SimpleNamespace(local_rank=0)
+    if pytest.use_hpu:
+        args.use_hpu = True
+        args.no_cuda = True
     engine, optim, _, _ = deepspeed.initialize(args=args,
                                                model=net,
                                                model_parameters=net.parameters(),
@@ -119,6 +132,7 @@ def test_ext_param_getattr():
     engine.step()
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-101073")
 def test_scatter_halftype():
     setup_serial_env()
 
@@ -207,9 +221,19 @@ class DanglingExt(torch.nn.Module):
 def test_ext_param_return():
     setup_serial_env()
 
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config["fp16"]["enabled"] = False
+            config["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config)
+        if not hpu_flag:
+            pytest.skip(msg)
     net = DanglingExt()
 
     args = SimpleNamespace(local_rank=0)
+    if pytest.use_hpu:
+        args.use_hpu = True
+        args.no_cuda = False
     engine, optim, _, _ = deepspeed.initialize(args=args,
                                                model=net,
                                                model_parameters=net.parameters(),
@@ -227,9 +251,19 @@ def test_ext_param_returnobj():
     setup_serial_env()
     print()
 
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config["fp16"]["enabled"] = False
+            config["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config)
+        if not hpu_flag:
+            pytest.skip(msg)
     net = ModelContainer(return_obj=True)
 
     args = SimpleNamespace(local_rank=0)
+    if pytest.use_hpu:
+        args.use_hpu = True
+        args.no_cuda = False
     engine, optim, _, _ = deepspeed.initialize(args=args,
                                                model=net,
                                                model_parameters=net.parameters(),
@@ -263,10 +297,20 @@ class ModelContainerVariableOutputType(ModelContainer):
 def test_stage_3_output_type(output_type):
     setup_serial_env()
     print()
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config["fp16"]["enabled"] = False
+            config["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     net = ModelContainerVariableOutputType(output_type=output_type)
 
     args = SimpleNamespace(local_rank=0)
+    if pytest.use_hpu:
+        args.use_hpu = True
+        args.no_cuda = False
     engine, optim, _, _ = deepspeed.initialize(args=args,
                                                model=net,
                                                model_parameters=net.parameters(),
@@ -303,6 +347,7 @@ class ConvNet(torch.nn.Module):
         return x
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-101073")
 def test_subclass_param():
     setup_serial_env()
     with deepspeed.zero.Init(config=config):
@@ -343,6 +388,7 @@ class Son(Pa):
                                    1).data  # test param is not yet partitioned
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-101073")
 def test_subclass_param_init():
     setup_serial_env()
     with deepspeed.zero.Init(config=config):
@@ -359,3 +405,31 @@ def test_subclass_param_init():
         assert torch.equal(model.param, ones + 1)
         assert torch.equal(model.param_pa, ones + 2)
         assert torch.equal(model.param_grandpa, ones + 3)
+
+
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-101073")
+@distributed_test(world_size=2)
+def test_ds_init_w_zinit():
+    ds_config = {
+        "train_batch_size": 2,
+        "steps_per_print": 1,
+        "optimizer": {
+            "type": "Adam",
+            "params": {
+                "lr": 0.00015
+            }
+        }
+    }
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super(Model, self).__init__()
+            self.linear = torch.nn.Linear(4, 4)
+
+        def magic(self):
+            return 42
+
+    with deepspeed.zero.Init():
+        model = Model()
+        engine, *_ = deepspeed.initialize(model=model, config=ds_config, model_parameters=model.parameters())
+    assert engine.magic() == 42

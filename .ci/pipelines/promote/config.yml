@@ -1,0 +1,4 @@
+orchestratorConfig:
+  cron: "H H/4 * * *"
+stepConfig:
+  jobTimeout: '250'

@@ -1,12 +1,13 @@
 import pytest
 import torch
-import deepspeed
 from deepspeed.runtime.zero.linear import LinearModuleForZeroStage3
 
+if pytest.use_hpu:
+    pytest.skip("AMP autocast and half_op is no supported by HPU.", allow_module_level=True)
 
 def _skip_autocast_test():
     try:
-        from torch.cuda.amp import custom_fwd, custom_bwd
+        from torch.cuda.amp import custom_fwd, custom_bwd  # noqa: F401
     except (ImportError, AttributeError) as exp:
         return True
 

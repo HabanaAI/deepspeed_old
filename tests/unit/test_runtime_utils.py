@@ -1,11 +1,9 @@
-from deepspeed.moe.utils import is_moe_param, split_params_grads_into_shared_and_expert_params, split_params_into_shared_and_expert_params
 import torch
 from torch._utils import _flatten_dense_tensors
-import torch.distributed as dist
+import deepspeed.comm as dist
 import pytest
 
 import deepspeed.runtime.utils as ds_utils
-from deepspeed.utils.logging import log_dist
 import deepspeed.utils.groups as groups
 
 from .common import distributed_test
@@ -21,14 +19,14 @@ def test_call_to_str():
     assert c2s('hello', val=3) == 'hello(val=3)'
     assert c2s('hello', 1138, val=3) == 'hello(1138, val=3)'
 
-
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100874")
 def test_clip_grad_norm_():
     @distributed_test(world_size=[2])
     def _test_clip_grad_norm_() -> None:
-        param1 = torch.nn.Parameter(torch.Tensor([0]))
-        param1.grad = torch.Tensor([1])
-        param2 = torch.nn.Parameter(torch.Tensor([0]))
-        param2.grad = torch.Tensor([dist.get_rank() + 1])
+        param1 = torch.nn.Parameter(torch.Tensor([0])).cuda()
+        param1.grad = torch.Tensor([1]).cuda()
+        param2 = torch.nn.Parameter(torch.Tensor([0])).cuda()
+        param2.grad = torch.Tensor([dist.get_rank() + 1]).cuda()
         # param2 is now MoE parameter
         param2.allreduce = False
 
@@ -40,15 +38,19 @@ def test_clip_grad_norm_():
         norm = torch.Tensor([norm]).to(dist.get_rank())
 
         world_size = dist.get_world_size()
-        gathered_norm = [torch.zeros(1).cuda() for i in range(world_size)]
+        if pytest.use_hpu:
+            gathered_norm = [torch.zeros(1).to('hpu') for i in range(world_size)]
+        else:
+            gathered_norm = [torch.zeros(1).cuda() for i in range(world_size)]
 
-        torch.distributed.all_gather(gathered_norm, norm)
+        dist.all_gather(gathered_norm, norm)
 
         assert gathered_norm[0] == gathered_norm[1], "norm at rank 0 does not match the norm at rank 1"
 
     return _test_clip_grad_norm_()
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-101074")
 @pytest.mark.parametrize("check_using_norm", [(False), (True)])
 def test_CheckOverflow(check_using_norm):
     @distributed_test(world_size=[2])

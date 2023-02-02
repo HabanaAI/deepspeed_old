@@ -1,15 +1,16 @@
 import math
 from typing import Dict, List, Set
 import pytest
-import torch.distributed as dist
+import deepspeed.comm as dist
 import torch
+import os
 from torch import Tensor
 from torch.nn import Linear, Module
 from torch.nn.modules.container import ModuleList
 from torch.nn.modules.loss import L1Loss
 from torch.nn.parameter import Parameter
 
-from .common import distributed_test
+from .common import distributed_test, is_hpu_supported
 from .simple_model import SimpleModel, random_dataloader, args_from_dict
 
 import deepspeed
@@ -65,15 +66,28 @@ def test_zero_unbalanced_gradients(tmpdir, zero_stage):
     }
 
     hidden_dim = 4
-
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     model = SimpleModel(hidden_dim=hidden_dim)
+    args = args_from_dict(tmpdir, config_dict)
 
     @distributed_test(world_size=[1])
     def _test_zero_unbalanced_gradients(model, hidden_dim):
-        model, _, _, _ = deepspeed.initialize(config=config_dict,
+        model, _, _, _ = deepspeed.initialize(args=args,
                                               model=model,
                                               model_parameters=model.parameters())
-        data_loader = random_dataloader(model=model,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            data_loader = random_dataloader(model=model,
+                                        total_samples=16,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device, dtype=torch.bfloat16)
+        else:
+            data_loader = random_dataloader(model=model,
                                         total_samples=16,
                                         hidden_dim=hidden_dim,
                                         device=model.device)
@@ -107,7 +121,13 @@ def test_zero3_repeat_forward_loop(tmpdir, zero_stage):
             "initial_scale_power": 8
         }
     }
-
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     hidden_dim = 4
 
     class AlbertLikeModel(torch.nn.Module):
@@ -125,9 +145,11 @@ def test_zero3_repeat_forward_loop(tmpdir, zero_stage):
 
     model = AlbertLikeModel(hidden_dim=hidden_dim)
 
+    args = args_from_dict(tmpdir, config_dict)
+
     @distributed_test(world_size=[1])
     def _test_zero3_repeat_forward_loop(model, hidden_dim):
-        model, _, _, _ = deepspeed.initialize(config=config_dict,
+        model, _, _, _ = deepspeed.initialize(args=args,
                                               model=model,
                                               model_parameters=model.parameters())
         data_loader = random_dataloader(model=model,
@@ -145,7 +167,8 @@ def test_zero3_repeat_forward_loop(tmpdir, zero_stage):
 
 # testing the fix https://github.com/microsoft/DeepSpeed/pull/1227
 # also reproduces the https://github.com/microsoft/DeepSpeed/pull/1372
-@pytest.mark.parametrize('zero_stage', [2, 3])
+@pytest.mark.parametrize('zero_stage', [pytest.param(2, marks=pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")),
+                                        3])
 def test_zero_to_fp32_1_param_group(tmpdir, zero_stage):
 
     # XXX: ideally refactor with the 2_param_group test as 75% is the same
@@ -170,6 +193,13 @@ def test_zero_to_fp32_1_param_group(tmpdir, zero_stage):
             "initial_scale_power": 8
         }
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     @distributed_test(world_size=[2])
     def _test_zero_to_fp32():
@@ -199,11 +229,18 @@ def test_zero_to_fp32_1_param_group(tmpdir, zero_stage):
         # we want at least 2x layers as there are gpus to trigger round_robin_fp16_groups reshuffle in zero2
         n_layers = world_size * 2
         model = MyModel(hidden_dim=hidden_dim, n_layers=n_layers)
+        args = args_from_dict(tmpdir, config_dict)
 
-        model, _, _, _ = deepspeed.initialize(config=config_dict,
+        model, _, _, _ = deepspeed.initialize(args=args,
                                               model=model,
                                               model_parameters=model.parameters())
-        data_loader = random_dataloader(model=model,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            data_loader = random_dataloader(model=model,
+                                        total_samples=16,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device, dtype=torch.bfloat16)
+        else:
+            data_loader = random_dataloader(model=model,
                                         total_samples=16,
                                         hidden_dim=hidden_dim,
                                         device=model.device)
@@ -243,7 +280,8 @@ def test_zero_to_fp32_1_param_group(tmpdir, zero_stage):
     _test_zero_to_fp32()
 
 
-@pytest.mark.parametrize('zero_stage', [2, 3])
+@pytest.mark.parametrize('zero_stage', [pytest.param(2, marks=pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100705")),
+                                        3])
 def test_zero_to_fp32_2_param_groups(tmpdir, zero_stage):
 
     # TODO:
@@ -270,6 +308,13 @@ def test_zero_to_fp32_2_param_groups(tmpdir, zero_stage):
             "initial_scale_power": 8
         }
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     @distributed_test(world_size=[2])
     def _test_zero_to_fp32():
@@ -304,13 +349,20 @@ def test_zero_to_fp32_2_param_groups(tmpdir, zero_stage):
             },
         ]
         optim = torch.optim.SGD(optim_groups, lr=0.1)
+        args = args_from_dict(tmpdir, config_dict)
 
         model, _, _, _ = deepspeed.initialize(model=model,
                                               model_parameters=model.parameters(),
                                               optimizer=optim,
-                                              config=config_dict
+                                              args=args
         )
-        data_loader = random_dataloader(model=model,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            data_loader = random_dataloader(model=model,
+                                        total_samples=16,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device, dtype=torch.bfloat16)
+        else:
+            data_loader = random_dataloader(model=model,
                                         total_samples=16,
                                         hidden_dim=hidden_dim,
                                         device=model.device)
@@ -373,18 +425,26 @@ def test_incorrect_allgather_bucket_size(tmpdir, zero_stage, allgather_bucket_si
     }
 
     hidden_dim = 4
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     model = SimpleModel(hidden_dim=hidden_dim)
+    args = args_from_dict(tmpdir, config_dict)
 
     @distributed_test(world_size=[1])
     def _test_incorrect_allgather_bucket_size(model, hidden_dim):
         if allgather_bucket_size % 2 == 0:
-            model, _, _, _ = deepspeed.initialize(config=config_dict,
+            model, _, _, _ = deepspeed.initialize(args=args,
                                               model=model,
                                               model_parameters=model.parameters())
         else:
             with pytest.raises(AssertionError) as assertinfo:
-                model, _, _, _ = deepspeed.initialize(config=config_dict,
+                model, _, _, _ = deepspeed.initialize(args=args,
                                                   model=model,
                                                   model_parameters=model.parameters())
             assert "allgather_bucket_size must be a multiple of nccl_start_alignment_factor" in str(
@@ -413,14 +473,22 @@ def test_partition_nccl_alignment(tmpdir, zero_stage, world_size):
             "initial_scale_power": 8
         }
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     hidden_dim = 4
 
     model = SimpleModel(hidden_dim=hidden_dim)
+    args = args_from_dict(tmpdir, config_dict)
 
     @distributed_test(world_size=world_size)
     def _test_partition_nccl_alignment(model, hidden_dim):
-        model, _, _, _ = deepspeed.initialize(config=config_dict,
+        model, _, _, _ = deepspeed.initialize(args=args,
                                               model=model,
                                               model_parameters=model.parameters())
 
@@ -437,10 +505,11 @@ def test_partition_nccl_alignment(tmpdir, zero_stage, world_size):
     _test_partition_nccl_alignment(model=model, hidden_dim=hidden_dim)
 
 
-def _ds_initialize_for_param_partitioning_testing(model: Module,
+def _ds_initialize_for_param_partitioning_testing(tmpdir, model: Module,
                                                   cfg: dict) -> DeepSpeedEngine:
+    args = args_from_dict(tmpdir, cfg)
     ds_engine, _, _, _ = deepspeed.initialize(
-        config=cfg,
+        args=args,
         model=model,
         model_parameters=model.parameters()
     )
@@ -486,35 +555,42 @@ class EltwiseMultiplicationTestNetwork(Module):
 
         self.loss = L1Loss(reduction="none")
 
-    def forward(self, x: Tensor, y: Tensor, prefetching: bool) -> Dict[str, Tensor]:
+    def forward(self,
+                x: Tensor,
+                y: Tensor,
+                use_module_trace: bool,
+                param_prefetching: bool) -> Dict[str,
+                                                 Tensor]:
         _assert_partition_status(
             self,
             {
                 ZeroParamStatus.NOT_AVAILABLE,
                 ZeroParamStatus.INFLIGHT,
                 ZeroParamStatus.AVAILABLE
-            } if prefetching else {ZeroParamStatus.NOT_AVAILABLE})
+            } if use_module_trace else {ZeroParamStatus.NOT_AVAILABLE})
 
-        layerwise_expected_states = {
-            ZeroParamStatus.INFLIGHT if prefetching else ZeroParamStatus.NOT_AVAILABLE,
+        pre_layer_expected_states = {
+            ZeroParamStatus.INFLIGHT
+            if param_prefetching else ZeroParamStatus.NOT_AVAILABLE,
             ZeroParamStatus.AVAILABLE,
         }
 
-        _assert_partition_status(self.__layer1, layerwise_expected_states)
+        post_layer_expected_states = {
+            ZeroParamStatus.AVAILABLE
+            if param_prefetching else ZeroParamStatus.NOT_AVAILABLE,
+        }
+
+        _assert_partition_status(self.__layer1, pre_layer_expected_states)
         hidden1 = self.__layer1(x)
-        _assert_partition_status(self.__layer1, {ZeroParamStatus.NOT_AVAILABLE})
+        _assert_partition_status(self.__layer1, post_layer_expected_states)
 
-        _assert_partition_status(self.__layer2, layerwise_expected_states)
+        _assert_partition_status(self.__layer2, pre_layer_expected_states)
         hidden2 = self.__layer2(hidden1)
-        _assert_partition_status(self.__layer2, {ZeroParamStatus.NOT_AVAILABLE})
+        _assert_partition_status(self.__layer2, post_layer_expected_states)
 
-        _assert_partition_status(self.__layer3, layerwise_expected_states)
+        _assert_partition_status(self.__layer3, pre_layer_expected_states)
         y_hat = self.__layer3(hidden2)
-        _assert_partition_status(self.__layer3,
-                                 {
-                                     ZeroParamStatus.AVAILABLE
-                                     if prefetching else ZeroParamStatus.NOT_AVAILABLE
-                                 })
+        _assert_partition_status(self.__layer3, post_layer_expected_states)
 
         loss = self.loss(y_hat, y)
 
@@ -524,7 +600,7 @@ class EltwiseMultiplicationTestNetwork(Module):
                 ZeroParamStatus.NOT_AVAILABLE,
                 ZeroParamStatus.INFLIGHT,
                 ZeroParamStatus.AVAILABLE
-            } if prefetching else {ZeroParamStatus.NOT_AVAILABLE})
+            } if use_module_trace else {ZeroParamStatus.NOT_AVAILABLE})
 
         return {
             "hidden1": hidden1,
@@ -539,15 +615,42 @@ class EltwiseMultiplicationTestNetwork(Module):
 @pytest.mark.parametrize("contiguous_gradients", [True, False])
 @pytest.mark.parametrize("offload_optimizer", [True, False])
 @pytest.mark.parametrize("zero_grad", [True, False])
-@pytest.mark.parametrize("iteration", list(range(1)))
+@pytest.mark.parametrize("prefetching", [True, False])
 def test_zero3_param_partitioning_base(
     param_persistence_threshold: int,
     fp16_enabled: bool,
     contiguous_gradients: bool,
     offload_optimizer: bool,
     zero_grad: bool,
-    iteration: int,
+    prefetching: bool,
 ) -> None:
+    cfg = {
+        "train_micro_batch_size_per_gpu": 1,
+        "zero_optimization": {
+            "stage": 3,
+            "stage3_max_reuse_distance": 0,
+            "stage3_param_persistence_threshold": param_persistence_threshold,
+            "contiguous_gradients": contiguous_gradients,
+        },
+        "optimizer": {
+            "type": "Adam",
+            "params": {
+                "lr": 1.
+            }
+        },
+        "fp16": {
+            "enabled": fp16_enabled,
+            "loss_scale": 1.,
+        }
+    }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            cfg["fp16"]["enabled"] = False
+            cfg["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(cfg)
+        if not hpu_flag:
+            pytest.skip(msg)
+
     @distributed_test(world_size=[2])
     def _test_zero3_param_partitioning():
         if offload_optimizer and not contiguous_gradients:
@@ -557,7 +660,7 @@ def test_zero3_param_partitioning_base(
         n = 5
         weights = [Parameter(torch.zeros((m, n), dtype=torch.float32)) for _ in range(3)]
         model = EltwiseMultiplicationTestNetwork(*weights)
-
+        prefetch_bucket_size = sum([p.numel() for p in model.parameters(recurse=True)])
         cfg = {
             "train_micro_batch_size_per_gpu": 1,
             "zero_optimization": {
@@ -565,6 +668,7 @@ def test_zero3_param_partitioning_base(
                 "stage3_max_reuse_distance": 0,
                 "stage3_param_persistence_threshold": param_persistence_threshold,
                 "contiguous_gradients": contiguous_gradients,
+                "stage3_prefetch_bucket_size": prefetch_bucket_size if prefetching else 0
             },
             "optimizer": {
                 "type": "Adam",
@@ -584,7 +688,7 @@ def test_zero3_param_partitioning_base(
                 "pin_memory": True,
             }
 
-        ds_engine = _ds_initialize_for_param_partitioning_testing(model, cfg)
+        ds_engine = _ds_initialize_for_param_partitioning_testing(tmpdir, model, cfg)
         for i, weight in enumerate(weights):
             weight.ds_tensor.data = torch.full_like(weight.ds_tensor.data,
                                                     (i + 1) * (1 + dist.get_rank()))
@@ -672,7 +776,8 @@ def test_zero3_param_partitioning_base(
                               n),
                              dtype=torch.float16 if fp16_enabled else torch.float32,
                              device=ds_engine.device),
-                prefetching=train_iter > 0,
+                use_module_trace=train_iter > 0,
+                param_prefetching=prefetching and train_iter > 0,
             )
             assert torch.allclose(activations["hidden1"], expected_hidden1)
             assert torch.allclose(activations["hidden2"], expected_hidden2)
@@ -749,9 +854,36 @@ def test_zero3_param_partitioning_base(
 @pytest.mark.parametrize("world_sz", [1, 2, 4])
 @pytest.mark.parametrize("param_sz", [8100])
 @pytest.mark.parametrize("init_context_manager", [True, False])
-def test_zero3_param_partitioning_large_param(world_sz: int,
+def test_zero3_param_partitioning_large_param(tmpdir, world_sz: int,
                                               param_sz: int,
                                               init_context_manager: bool) -> None:
+    ds_config = {
+        "train_micro_batch_size_per_gpu": 1,
+        "zero_optimization": {
+            "stage": 3,
+            "stage3_max_reuse_distance": 0,
+            "contiguous_gradients": True,
+            "overlap_comm": True,
+        },
+        "optimizer": {
+            "type": "Adam",
+            "params": {
+                "lr": 1.
+            }
+        },
+        "fp16": {
+            "enabled": True,
+            "loss_scale": 1.,
+        }
+    }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            ds_config["fp16"]["enabled"] = False
+            ds_config["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(ds_config)
+        if not hpu_flag:
+            pytest.skip(msg)
+
     class LargeParamModel(Module):
         def __init__(self):
             super().__init__()
@@ -772,29 +904,10 @@ def test_zero3_param_partitioning_large_param(world_sz: int,
 
     @distributed_test(world_size=[world_sz])
     def _distributed_test():
-        ds_config = {
-            "train_micro_batch_size_per_gpu": 1,
-            "zero_optimization": {
-                "stage": 3,
-                "stage3_max_reuse_distance": 0,
-                "contiguous_gradients": True,
-                "overlap_comm": True,
-            },
-            "optimizer": {
-                "type": "Adam",
-                "params": {
-                    "lr": 1.
-                }
-            },
-            "fp16": {
-                "enabled": True,
-                "loss_scale": 1.,
-            }
-        }
         with deepspeed.zero.Init(mem_efficient_linear=False,
                                  enabled=init_context_manager):
             model = LargeParamModel()
-        ds_engine = _ds_initialize_for_param_partitioning_testing(model, ds_config)
+        ds_engine = _ds_initialize_for_param_partitioning_testing(tmpdir, model, ds_config)
 
         for train_iter in range(3):  # test multiple iterations to cover prefetching
             activation: Tensor = ds_engine(
@@ -830,7 +943,7 @@ def test_zero3_param_partitioning_large_param(world_sz: int,
 @pytest.mark.parametrize("param_sz", [100, 1_000, 10_000])
 @pytest.mark.parametrize("n_layers", [100, 1_000])
 @pytest.mark.parametrize("init_context_manager", [True, False])
-def test_zero3_param_partitioning_many_params(world_sz: int,
+def test_zero3_param_partitioning_many_params(tmpdir, world_sz: int,
                                               param_sz: int,
                                               n_layers: int,
                                               init_context_manager: bool) -> None:
@@ -864,35 +977,41 @@ def test_zero3_param_partitioning_many_params(world_sz: int,
                 activations.append(x)
 
             return activations
+    ds_cfg = {
+        "train_micro_batch_size_per_gpu": 1,
+        "zero_optimization": {
+            "stage": 3,
+            "stage3_max_reuse_distance": 0,
+            "contiguous_gradients": True,
+            "overlap_comm": True,
+        },
+        "optimizer": {
+            "type": "Adam",
+            "params": {
+                "lr": 1.
+            }
+        },
+        "fp16": {
+            "enabled": True,
+            "loss_scale": 1.,
+        }
+    }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            ds_cfg["fp16"]["enabled"] = False
+            ds_cfg["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(ds_cfg)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     @distributed_test(world_size=[world_sz])
     def _distributed_test():
-        ds_cfg = {
-            "train_micro_batch_size_per_gpu": 1,
-            "zero_optimization": {
-                "stage": 3,
-                "stage3_max_reuse_distance": 0,
-                "contiguous_gradients": True,
-                "overlap_comm": True,
-            },
-            "optimizer": {
-                "type": "Adam",
-                "params": {
-                    "lr": 1.
-                }
-            },
-            "fp16": {
-                "enabled": True,
-                "loss_scale": 1.,
-            }
-        }
-
         with deepspeed.zero.Init(config=ds_cfg,
                                  mem_efficient_linear=False,
                                  enabled=init_context_manager):
             model = ManyParamModel()
 
-        ds_engine = _ds_initialize_for_param_partitioning_testing(model, ds_cfg)
+        ds_engine = _ds_initialize_for_param_partitioning_testing(tmpdir, model, ds_cfg)
 
         for _ in range(3):  # test multiple iterations to cover prefetching
             activations: List[Tensor] = ds_engine(
@@ -941,29 +1060,35 @@ def test_zero3_init_for_parent_weight_initialization(world_sz):
             if isinstance(module, Linear):
                 with torch.no_grad():
                     module.weight.fill_(1 + dist.get_rank())
+    ds_cfg = {
+        "train_micro_batch_size_per_gpu": 1,
+        "zero_optimization": {
+            "stage": 3,
+            "stage3_max_reuse_distance": 0,
+            "contiguous_gradients": True,
+            "overlap_comm": True,
+        },
+        "optimizer": {
+            "type": "Adam",
+            "params": {
+                "lr": 1.
+            }
+       },
+       "fp16": {
+            "enabled": True,
+            "loss_scale": 1.,
+        }
+    }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            ds_cfg["fp16"]["enabled"] = False
+            ds_cfg["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(ds_cfg)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     @distributed_test(world_size=[world_sz])
     def _distributed_test():
-        ds_cfg = {
-            "train_micro_batch_size_per_gpu": 1,
-            "zero_optimization": {
-                "stage": 3,
-                "stage3_max_reuse_distance": 0,
-                "contiguous_gradients": True,
-                "overlap_comm": True,
-            },
-            "optimizer": {
-                "type": "Adam",
-                "params": {
-                    "lr": 1.
-                }
-            },
-            "fp16": {
-                "enabled": True,
-                "loss_scale": 1.,
-            }
-        }
-
         with deepspeed.zero.Init(config=ds_cfg,
                                  mem_efficient_linear=False,
                                  enabled=True):
@@ -977,20 +1102,44 @@ def test_zero3_init_for_parent_weight_initialization(world_sz):
     _distributed_test()
 
 
-@pytest.mark.skip(
+@pytest.mark.skipif(pytest.use_hpu != True,
     reason="depends on upgraded pytorch and nccl that isn't always available")
 @pytest.mark.parametrize("param_persistence_threshold", [0, 10])
 @pytest.mark.parametrize("contiguous_gradients", [True, False])
 @pytest.mark.parametrize("offload_optimizer", [True, False])
 @pytest.mark.parametrize("zero_grad", [True])
 @pytest.mark.parametrize("iteration", list(range(1)))
-def test_zero3_param_partitioning_base_bf16(
+def test_zero3_param_partitioning_base_bf16( tmpdir,
     param_persistence_threshold: int,
     contiguous_gradients: bool,
     offload_optimizer: bool,
     zero_grad: bool,
     iteration: int,
 ) -> None:
+    cfg = {
+        "train_micro_batch_size_per_gpu": 1,
+        "zero_optimization": {
+            "stage": 3,
+            "stage3_max_reuse_distance": 0,
+            "stage3_param_persistence_threshold": param_persistence_threshold,
+            "contiguous_gradients": contiguous_gradients,
+        },
+        "optimizer": {
+            "type": "Adam",
+            "params": {
+                "lr": 1.
+            }
+        },
+        "bf16": {
+            "enabled": True,
+            "loss_scale": 1.,
+        }
+    }
+    if pytest.use_hpu:
+        hpu_flag, msg = is_hpu_supported(cfg)
+        if not hpu_flag:
+            pytest.skip(msg)
+
     @distributed_test(world_size=[2])
     def _test_zero3_param_partitioning():
         if offload_optimizer and not contiguous_gradients:
@@ -1001,33 +1150,13 @@ def test_zero3_param_partitioning_base_bf16(
         weights = [Parameter(torch.zeros((m, n), dtype=torch.float32)) for _ in range(3)]
         model = EltwiseMultiplicationTestNetwork(*weights)
 
-        cfg = {
-            "train_micro_batch_size_per_gpu": 1,
-            "zero_optimization": {
-                "stage": 3,
-                "stage3_max_reuse_distance": 0,
-                "stage3_param_persistence_threshold": param_persistence_threshold,
-                "contiguous_gradients": contiguous_gradients,
-            },
-            "optimizer": {
-                "type": "Adam",
-                "params": {
-                    "lr": 1.
-                }
-            },
-            "bf16": {
-                "enabled": True,
-                "loss_scale": 1.,
-            }
-        }
-
         if offload_optimizer:
             cfg["zero_optimization"]["offload_optimizer"] = {
                 "device": "cpu",
                 "pin_memory": True,
             }
 
-        ds_engine = _ds_initialize_for_param_partitioning_testing(model, cfg)
+        ds_engine = _ds_initialize_for_param_partitioning_testing(tmpdir, model, cfg)
         for i, weight in enumerate(weights):
             weight.ds_tensor.data = torch.full_like(weight.ds_tensor.data,
                                                     (i + 1) * (1 + dist.get_rank()))
@@ -1181,7 +1310,7 @@ def test_zero3_param_partitioning_base_bf16(
     _test_zero3_param_partitioning()
 
 
-def test_zero_offload_stage1():
+def test_zero_offload_stage1(tmpdir):
     config_dict = {
         "train_batch_size": 4,
         "gradient_accumulation_steps": 2,
@@ -1202,12 +1331,95 @@ def test_zero_offload_stage1():
             }
         }
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     hidden_dim = 10
     model = SimpleModel(hidden_dim)
+    args = args_from_dict(tmpdir, config_dict)
 
     @distributed_test(world_size=[2])
     def _go(model, hidden_dim):
+        model, _, _, _ = deepspeed.initialize(model=model,
+                                              model_parameters=model.parameters(),
+                                              args=args)
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            data_loader = random_dataloader(model=model,
+                                        total_samples=50,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device, dtype=torch.bfloat16)
+        else:
+            data_loader = random_dataloader(model=model,
+                                        total_samples=50,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device)
+        dist.barrier()
+        for n, batch in enumerate(data_loader):
+            loss = model(batch[0], batch[1])
+            model.backward(loss)
+            model.step()
+
+    _go(model=model, hidden_dim=hidden_dim)
+
+
+@pytest.mark.parametrize('return_type', [tuple, list, dict])
+def test_z3_dict_fwd(return_type):
+    config_dict = {
+        "train_batch_size": 4,
+        "steps_per_print": 1,
+        "optimizer": {
+            "type": "Adam",
+            "params": {
+                "lr": 1e-4
+            }
+        },
+        "fp16": {
+            "enabled": True
+        },
+        "zero_optimization": {
+            "stage": 3
+        }
+    }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
+
+
+    hidden_dim = 10
+
+    class MyModel(torch.nn.Module):
+        def __init__(self, hidden_dim):
+            super(MyModel, self).__init__()
+            self.l1 = torch.nn.Linear(hidden_dim, hidden_dim)
+            self.cel = torch.nn.CrossEntropyLoss()
+
+        def forward(self, x, y):
+            x = self.l1(x)
+            loss = self.cel(x, y)
+            if return_type == dict:
+                val = {'a': x, 'loss': loss, 'b': 1, 'c': None}
+            elif return_type == list:
+                val = [x, loss]
+            elif return_type == tuple:
+                val = (x, loss)
+            else:
+                raise NotImplementedError
+            return val
+
+    @distributed_test(world_size=[1])
+    def _go(hidden_dim):
+        with deepspeed.zero.Init():
+            model = MyModel(hidden_dim)
+
         model, _, _, _ = deepspeed.initialize(model=model,
                                               model_parameters=model.parameters(),
                                               config=config_dict)
@@ -1215,10 +1427,83 @@ def test_zero_offload_stage1():
                                         total_samples=50,
                                         hidden_dim=hidden_dim,
                                         device=model.device)
-        torch.distributed.barrier()
+        dist.barrier()
         for n, batch in enumerate(data_loader):
+            loss = model(batch[0], batch[1])
+            if return_type == dict:
+                loss = loss['loss']
+            else:
+                loss = loss[1]
+            model.backward(loss)
+            model.step()
+
+    _go(hidden_dim)
+
+
+@pytest.mark.parametrize('zero_stage', [1, 2, 3])
+def test_zero_adam_optimizer_step_count(tmpdir, zero_stage):
+
+    # force all params to be partitioned by forcing threshold=0
+    config_dict = {
+        "train_micro_batch_size_per_gpu": 2,
+        "gradient_accumulation_steps": 2,
+        "steps_per_print": 1,
+        "zero_optimization": {
+            "stage": zero_stage,
+            "stage3_param_persistence_threshold": 0,
+            "sub_group_size": 4,
+        },
+        "optimizer": {
+            "type": "Adam",
+            "params": {
+                "lr": 1e-3
+            }
+        },
+        "fp16": {
+            "enabled": True,
+            "initial_scale_power": 8
+        }
+    }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
+    args = args_from_dict(tmpdir, config_dict)
+
+    hidden_dim = 4
+
+    model = SimpleModel(hidden_dim=hidden_dim, nlayers=12)
+
+    @distributed_test(world_size=[1])
+    def _test_zero_adam_optimizer_step_count_loop(model, hidden_dim):
+        model, optimizer, _, _ = deepspeed.initialize(args=args,
+                                                      model=model,
+                                                      model_parameters=model.parameters())
+        data_loader = random_dataloader(model=model,
+                                        total_samples=16,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device, dtype=torch.bfloat16)
+
+        for i, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
             model.backward(loss)
             model.step()
 
-    _go(model=model, hidden_dim=hidden_dim)
+            step_counts = []
+            if zero_stage == 3:
+                for sub_group_id, _ in enumerate(optimizer.fp16_groups):
+                    fp32_param = optimizer.fp32_partitioned_groups_flat[sub_group_id]
+                    state = optimizer.optimizer.state[fp32_param]
+                    step_counts.append(state['step'])
+                assert all(step == step_counts[0] for step in step_counts)
+            elif zero_stage == 1 or zero_stage == 2:
+                for param_group in optimizer.optimizer.param_groups:
+                    for param in param_group['params']:
+                        state = optimizer.optimizer.state[param]
+                        step_counts.append(state['step'])
+                assert all(step == step_counts[0] for step in step_counts)
+
+    _test_zero_adam_optimizer_step_count_loop(model=model, hidden_dim=hidden_dim)

@@ -1,0 +1,6 @@
+config:
+  jobTimeout: '90'
+  gerritTriggerMap:
+  - repository: deepspeed-fork
+  osBuild:
+    debian10.10: 'on'

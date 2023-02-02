@@ -1,13 +1,17 @@
 import torch
 import deepspeed
-import argparse
 import pytest
-import json
-import os
 import numpy as np
-from .common import distributed_test
+from .common import distributed_test, is_hpu_supported,get_hpu_dev_version
 from .simple_model import SimpleModel, args_from_dict
 
+if pytest.use_hpu:
+    if get_hpu_dev_version() == 'Gaudi':
+        pytest.skip("FP16 related tests not supported by HPU", allow_module_level=True)
+    elif get_hpu_dev_version() == 'Gaudi2':
+        pytest.skip("FP16 datatype support is not added for Gaudi2. SW-111219", allow_module_level=True)
+    else:
+        pass
 
 def run_model_step(model, gradient_list):
     for value in gradient_list:

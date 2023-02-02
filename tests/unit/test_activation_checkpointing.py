@@ -10,7 +10,11 @@ import deepspeed
 
 ckpt = deepspeed.checkpointing.checkpoint
 
-from .common import distributed_test
+from .common import distributed_test, get_hpu_dev_version
+
+if pytest.use_hpu:
+    if get_hpu_dev_version() == 'Gaudi':
+        pytest.skip("Skip due to SW-113006.", allow_module_level=True)
 
 
 def _compute(module, *inputs, do_checkpoint=False):
@@ -40,7 +44,10 @@ def _prep_inputs(*inputs):
     for inp in inputs:
         inp = deepcopy(inp)
         if torch.is_tensor(inp):
-            inp = inp.cuda()
+            if pytest.use_hpu:
+                inp = inp.to("hpu")
+            else:
+                inp = inp.cuda()
         _inputs.append(inp)
 
     return tuple(_inputs)
@@ -59,12 +66,15 @@ def _match_outputs(ref, tgt):
         assert torch.equal(ref, tgt)
 
 
-# This is distributed because checkpoint() assumes that torch.distributed is initialized.
-# torch.distributed is used with activation partitioning, but not for these simple cases.
+# This is distributed because checkpoint() assumes that deepspeed.comm is initialized.
+# deepspeed.comm is used with activation partitioning, but not for these simple cases.
 @distributed_test(world_size=1)
 def _test_activation_checkpoint(module, *inputs):
     # Move to device
-    module.cuda()
+    if pytest.use_hpu:
+        module.to(("hpu"))
+    else:
+        module.cuda()
 
     # Get rid of dropouts until we fork the RNG between tests.
     module.eval()
@@ -82,12 +92,15 @@ def _test_activation_checkpoint(module, *inputs):
             _match_outputs(b, t)
 
 
-# This is distributed because checkpoint() assumes that torch.distributed is initialized.
-# torch.distributed is used with activation partitioning, but not for these simple cases.
+# This is distributed because checkpoint() assumes that deepspeed.comm is initialized.
+# deepspeed.comm is used with activation partitioning, but not for these simple cases.
 @distributed_test(world_size=1)
 def _test_activation_checkpoint_ordering(module, expected_ordering, *inputs):
     # Move to device
-    module.cuda()
+    if pytest.use_hpu:
+        module.to("hpu")
+    else:
+        module.cuda()
 
     # Get rid of dropouts until we fork the RNG between tests.
     module.eval()
@@ -159,6 +172,7 @@ def _bool_to_float(btensor, dtype=torch.float32):
 #
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-112883")
 def test_ckpt_inputs1_outputs1():
     module = torch.nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
     inputs = torch.rand(HIDDEN_DIM)
@@ -167,6 +181,7 @@ def test_ckpt_inputs1_outputs1():
 
 
 # both bool and float are important, as bool is not differentiable
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-112883")
 @pytest.mark.parametrize('mask',
                          [
                              _mixed_mask(),
@@ -179,6 +194,7 @@ def test_ckpt_inputs2_outputs1(mask):
     _test_activation_checkpoint(module, inputs, mask)
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-112883")
 @pytest.mark.parametrize('mask',
                          [
                              _mixed_mask(),
@@ -191,6 +207,7 @@ def test_ckpt_inputs2_outputs2(mask):
     _test_activation_checkpoint(module, inputs, mask)
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-112883")
 @pytest.mark.parametrize('mask',
                          [
                              _mixed_mask(),
@@ -208,6 +225,7 @@ class DropMaskLinear(torch.nn.Linear):
         return super().forward(x)
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-112883")
 def test_ckpt_arg_none():
     module = DropMaskLinear(HIDDEN_DIM, HIDDEN_DIM)
     inputs = (torch.rand(HIDDEN_DIM), None)
@@ -220,6 +238,7 @@ class LinearNonTensorInput(torch.nn.Linear):
         return super().forward(x)
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-112883")
 @pytest.mark.parametrize(
     'non_tensor_input',
     [None,
@@ -247,6 +266,7 @@ class LinearNonTensorOutput(torch.nn.Linear):
         return out, self.non_tensor_output
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-112883")
 @pytest.mark.parametrize(
     'non_tensor_output',
     [None,

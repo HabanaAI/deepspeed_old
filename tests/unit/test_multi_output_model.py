@@ -1,11 +1,10 @@
 import torch
 import deepspeed
-import argparse
 import pytest
 from pytest import approx
 import json
 import os
-from .common import distributed_test
+from .common import distributed_test, is_hpu_supported
 from .simple_model import args_from_dict
 from .multi_output_model import MultiOutputModel, multi_output_dataloader
 
@@ -28,6 +27,7 @@ def create_config_dict(micro_batch_size, grad_accumulation_steps, world_size):
     }
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100874")
 def test_two_output_model(tmpdir):
     gradient_accumulation_steps = 2
     micro_batch_size = 1
@@ -35,6 +35,13 @@ def test_two_output_model(tmpdir):
     config_dict = create_config_dict(micro_batch_size,
                                      gradient_accumulation_steps,
                                      world_size)
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     hidden_dim = 10
     weight_value = 0.1
@@ -81,6 +88,7 @@ def test_two_output_model(tmpdir):
     _test_two_output_model(args=args, model=model, hidden_dim=hidden_dim)
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100874")
 def test_three_output_model(tmpdir):
     gradient_accumulation_steps = 3
     micro_batch_size = 1
@@ -88,6 +96,14 @@ def test_three_output_model(tmpdir):
     config_dict = create_config_dict(micro_batch_size,
                                      gradient_accumulation_steps,
                                      world_size)
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
+
 
     hidden_dim = 10
     weight_value = 0.1

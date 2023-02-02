@@ -3,7 +3,7 @@ import os
 import filecmp
 import torch
 import deepspeed
-import torch.distributed as dist
+import deepspeed.comm as dist
 from deepspeed.ops.aio import AsyncIOBuilder
 from .common import distributed_test
 
@@ -13,6 +13,8 @@ QUEUE_DEPTH = 2
 IO_SIZE = 16 * MEGA_BYTE
 IO_PARALLEL = 2
 
+if pytest.use_hpu:
+    import habana_frameworks.torch.core as htcore
 
 def _skip_if_no_aio():
     if not deepspeed.ops.__compatible_ops__[AsyncIOBuilder.NAME]:
@@ -33,7 +35,10 @@ def _get_test_file_and_buffer(tmpdir, ref_buffer, cuda_device, index=0):
     file_suffix = f'{dist.get_rank()}_{index}'
     test_file = os.path.join(tmpdir, f'_aio_write_random_{file_suffix}.pt')
     if cuda_device:
-        test_buffer = torch.cuda.ByteTensor(list(ref_buffer))
+        if pytest.use_hpu:
+            test_buffer = torch.ByteTensor(list(ref_buffer)).to('hpu')
+        else:
+            test_buffer = torch.cuda.ByteTensor(list(ref_buffer))
     else:
         test_buffer = torch.ByteTensor(list(ref_buffer)).pin_memory()
 
@@ -111,7 +116,10 @@ def test_async_read(tmpdir, single_submit, overlap_events, cuda_device):
         ref_file, _ = _do_ref_write(tmpdir)
 
         if cuda_device:
-            aio_buffer = torch.empty(IO_SIZE, dtype=torch.uint8, device='cuda')
+            if pytest.use_hpu:
+                aio_buffer = torch.empty(IO_SIZE, dtype=torch.uint8).to('hpu')
+            else:
+                aio_buffer = torch.empty(IO_SIZE, dtype=torch.uint8, device='cuda')
         else:
             aio_buffer = torch.empty(IO_SIZE,
                                      dtype=torch.uint8,
@@ -250,7 +258,10 @@ def test_async_queue_read(tmpdir, async_queue, cuda_device):
         aio_buffers = []
         for i in range(async_queue):
             if cuda_device:
-                buf = torch.empty(IO_SIZE, dtype=torch.uint8, device='cuda')
+                if pytest.use_hpu:
+                    buf = torch.empty(IO_SIZE, dtype=torch.uint8).to('hpu')
+                else:
+                    buf = torch.empty(IO_SIZE, dtype=torch.uint8, device='cuda')
             else:
                 buf = torch.empty(IO_SIZE, dtype=torch.uint8, device='cpu').pin_memory()
             aio_buffers.append(buf)

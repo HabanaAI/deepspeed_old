@@ -1,14 +1,17 @@
 import torch
-import torch.distributed as dist
 import deepspeed
 import pytest
-from .common import distributed_test
-
+from .common import distributed_test, is_hpu_supported
+from .simple_model import args_from_dict
 import deepspeed.utils.groups as groups
 
 
 def test_sparse_adam(tmpdir):
     config_dict = {"train_batch_size": 2, "steps_per_print": 1, "sparse_gradients": True}
+    if pytest.use_hpu:
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     class Model(torch.nn.Module):
         def __init__(self):
@@ -39,7 +42,13 @@ def test_sparse_adam(tmpdir):
 
     @distributed_test(world_size=[2])
     def _test(model, optimizer):
-        engine, _, _, _ = deepspeed.initialize(model=model,
+        if pytest.use_hpu:
+            args = args_from_dict(tmpdir, config_dict)
+            engine, _, _, _ = deepspeed.initialize(model=model,
+                                              optimizer=optimizer,
+                                              args=args)
+        else:
+            engine, _, _, _ = deepspeed.initialize(model=model,
                                               optimizer=optimizer,
                                               config=config_dict)
         loss = torch.nn.BCEWithLogitsLoss()

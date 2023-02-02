@@ -1,13 +1,8 @@
-import torch
-import torch.distributed as dist
 import deepspeed
-import argparse
 import pytest
-import json
 import os
-import numpy as np
-import time
-from .common import distributed_test
+import torch
+from .common import distributed_test, is_hpu_supported
 from .simple_model import Curriculum_SimpleModel, random_dataloader, args_from_dict
 
 
@@ -47,6 +42,13 @@ def test_curriculum_scheduler_fixed_discrete(tmpdir):
             }
         }
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
     ground_truths = {1: 1, 2: 1, 3: 2, 4: 2, 5: 3, 6: 3, 7: 4, 8: 4}
@@ -57,7 +59,13 @@ def test_curriculum_scheduler_fixed_discrete(tmpdir):
         model, _, _, _ = deepspeed.initialize(args=args,
                                               model=model,
                                               model_parameters=model.parameters())
-        data_loader = random_dataloader(model=model,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            data_loader = random_dataloader(model=model,
+                                        total_samples=20,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device, dtype=torch.float)
+        else:
+            data_loader = random_dataloader(model=model,
                                         total_samples=20,
                                         hidden_dim=hidden_dim,
                                         device=model.device)
@@ -105,6 +113,13 @@ def test_curriculum_scheduler_fixed_linear(tmpdir):
             }
         }
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
     ground_truths = {1: 2, 2: 4, 3: 4, 4: 6, 5: 6, 6: 8, 7: 8, 8: 10, 9: 10, 10: 10}
@@ -115,7 +130,13 @@ def test_curriculum_scheduler_fixed_linear(tmpdir):
         model, _, _, _ = deepspeed.initialize(args=args,
                                               model=model,
                                               model_parameters=model.parameters())
-        data_loader = random_dataloader(model=model,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            data_loader = random_dataloader(model=model,
+                                        total_samples=20,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device, dtype=torch.float)
+        else:
+            data_loader = random_dataloader(model=model,
                                         total_samples=20,
                                         hidden_dim=hidden_dim,
                                         device=model.device)

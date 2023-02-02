@@ -2,7 +2,7 @@ from deepspeed.utils import RepeatingLoader
 import torch
 import pytest
 import deepspeed
-from .common import distributed_test
+from .common import distributed_test, is_hpu_supported
 from .simple_model import SimpleModel, args_from_dict, random_dataset
 
 
@@ -31,6 +31,10 @@ def test_dataloader_drop_last(tmpdir, train_batch_size, drop_last):
         "dataloader_drop_last": drop_last,
         "steps_per_print": 1
     }
+    if pytest.use_hpu:
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
 
@@ -49,8 +53,13 @@ def test_dataloader_drop_last(tmpdir, train_batch_size, drop_last):
                                                                 training_data=train_dataset,
                                                                 optimizer=optimizer)
         for n, batch in enumerate(training_dataloader):
-            x = batch[0].to(torch.cuda.current_device())
-            y = batch[1].to(torch.cuda.current_device())
+            if pytest.use_hpu:
+                from habana_frameworks.torch.hpu import current_device
+                x = batch[0].to("hpu:" + str(current_device()))
+                y = batch[1].to("hpu:" + str(current_device()))
+            else:
+                x = batch[0].to(torch.cuda.current_device())
+                y = batch[1].to(torch.cuda.current_device())
             loss = model(x, y)
             model.backward(loss)
             model.step()

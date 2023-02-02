@@ -1,20 +1,22 @@
-import math
-from deepspeed.utils import groups
 import torch
-import torch.distributed as dist
+import deepspeed.comm as dist
 import deepspeed
-import argparse
 import pytest
-import json
-import os
 from deepspeed.ops.adam import FusedAdam
-from .common import distributed_test
+from .common import distributed_test, get_hpu_dev_version
 from deepspeed.ops.op_builder import CPUAdamBuilder
 from .simple_model import SimpleModel, SimpleOptimizer, random_dataloader, args_from_dict, create_deepspeed_args, SimpleMoEModel, sequence_dataloader
 from .util import required_torch_version
 
+if pytest.use_hpu:
+    if get_hpu_dev_version() == 'Gaudi':
+        pytest.skip("FP16 datatype is not supported by HPU", allow_module_level=True)
+    elif get_hpu_dev_version() == 'Gaudi2':
+        pytest.skip("FP16 datatype support is not added for Gaudi2. SW-111219", allow_module_level=True)
+    else:
+        pass
 try:
-    from apex import amp
+    from apex import amp  # noqa: F401
     _amp_available = True
 except ImportError:
     _amp_available = False

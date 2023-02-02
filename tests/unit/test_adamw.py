@@ -1,10 +1,11 @@
 import deepspeed
 import torch
 import pytest
+import os
 
 from deepspeed.ops.adam import FusedAdam
 from deepspeed.ops.adam import DeepSpeedCPUAdam
-from .common import distributed_test
+from .common import distributed_test, is_hpu_supported
 from .simple_model import SimpleModel, args_from_dict
 
 # yapf: disable
@@ -55,6 +56,13 @@ def test_adam_configs(tmpdir,
             "cpu_offload": zero_offload
         }
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = args_from_dict(tmpdir, config_dict)
 
     @distributed_test(world_size=[1])

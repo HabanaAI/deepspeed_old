@@ -2,15 +2,12 @@ import os
 import time
 
 import torch
-import torch.distributed as dist
+import deepspeed.comm as dist
 from torch.multiprocessing import Process
 
 import deepspeed
 
 import pytest
-from functools import wraps
-import unittest
-from pathlib import Path
 
 from pathlib import Path
 
@@ -66,7 +63,7 @@ def set_cuda_visibile():
 def distributed_test(world_size=2, backend='nccl'):
     """A decorator for executing a function (e.g., a unit test) in a distributed manner.
     This decorator manages the spawning and joining of processes, initialization of
-    torch.distributed, and catching of errors.
+    deepspeed.comm, and catching of errors.
 
     Usage example:
         @distributed_test(worker_size=[2,3])
@@ -82,7 +79,7 @@ def distributed_test(world_size=2, backend='nccl'):
     def dist_wrap(run_func):
         """Second-level decorator for dist_test. This actually wraps the function. """
         def dist_init(local_rank, num_procs, *func_args, **func_kwargs):
-            """Initialize torch.distributed and execute the user function. """
+            """Initialize deepspeed.comm and execute the user function. """
             os.environ['MASTER_ADDR'] = '127.0.0.1'
             os.environ['MASTER_PORT'] = get_master_port()
             os.environ['LOCAL_RANK'] = str(local_rank)
@@ -92,10 +89,14 @@ def distributed_test(world_size=2, backend='nccl'):
 
             # turn off NCCL logging if set
             os.environ.pop('NCCL_DEBUG', None)
-
-            set_cuda_visibile()
+            if pytest.use_hpu:
+                backend='hccl'
+            else:
+                set_cuda_visibile()
 
             deepspeed.init_distributed(dist_backend=backend)
+            #dist.init_process_group(backend=backend)
+            dist.barrier()
 
             if torch.cuda.is_available():
                 torch.cuda.set_device(local_rank)
@@ -103,10 +104,9 @@ def distributed_test(world_size=2, backend='nccl'):
             run_func(*func_args, **func_kwargs)
 
             # make sure all ranks finish at the same time
-            torch.distributed.barrier()
-
+            dist.barrier()
             # tear down after test completes
-            torch.distributed.destroy_process_group()
+            dist.destroy_process_group()
 
         def dist_launcher(num_procs, *func_args, **func_kwargs):
             """Launch processes and gracefully handle failures. """
@@ -164,6 +164,63 @@ def distributed_test(world_size=2, backend='nccl'):
 
     return dist_wrap
 
+def get_hpu_dev_version():
+    try:
+        command_output = os.popen('sudo hl-smi -L')
+        command_output_list = command_output.read()
+        device_id = [s for s in command_output_list.split('\n') if 'Device Id' in s][0].split()[-1]
+        if ('0x1da31000' in device_id) or ('0x1da31001' in device_id):
+            return "Gaudi"
+        elif '0x1da31020' in device_id:
+            return "Gaudi2"
+    except:
+        pass
+    return None
+
+
+def is_hpu_supported(config):
+    # FP16 is not supported by HPU.
+    if config.get('fp16'):
+        if config.get('fp16', None).get('enabled', None) == True:
+            if get_hpu_dev_version() == 'Gaudi':
+                return False, "FP16 datatype is not supported by HPU"
+    # Fused ADAM is not supported
+    if config.get('optimizer'):
+        if config.get('optimizer', None).get('params', None):
+            if config.get('optimizer', None).get('params', None).get('torch_adam', None) == False:
+                return False, "Fused ADAM optimizer is not supported by HPU"
+            if config.get('optimizer', None).get('type', None) == "Lamb":
+                return False, "LAMB optimizer is not supported by HPU"
+            if config.get('optimizer', None).get('type', None) == "OneBitAdam":
+                return False, "OneBitAdam optimizer is not supported by HPU"
+    # Zero-3 is not supported
+    if config.get('zero_optimization'):
+        if config.get('zero_optimization', None).get('stage', None) == 3:
+            return False, "DeepSpeed Stage3 is not supported by HPU"
+    # CPU offload is not supported
+    if config.get('zero_optimization'):
+        if config.get('zero_optimization', None).get('cpu_offload', None) == True:
+            return False, "CPU offload is not supported by HPU"
+        if config.get('zero_optimization', None).get('offload_param', None):
+            if config.get('zero_optimization', None).get('offload_param', None).get('device', None) == 'cpu':
+                return False, "CPU offload param is not supported by HPU"
+        if config.get('zero_optimization', None).get('offload_optimizer', None):
+            if config.get('zero_optimization', None).get('offload_optimizer', None).get('device', None) == 'cpu':
+                return False, "CPU offload optimizer is not supported by HPU"
+    # FLOPS profiler is not supported by HPU
+    if config.get('flops_profiler'):
+        if config.get('flops_profiler', None).get('enabled', None) == True:
+            return False, "FLOPS profiler is not supported by HPU"
+    # wall_clock_breakdown is not supported by HPU.
+    if 'wall_clock_breakdown' in config:
+        if config['wall_clock_breakdown'] == True:
+            return False, "Wall Clock breakdown is not supported by HPU"
+    # sparse gradients is not supported by HPU.
+    if 'sparse_gradients' in config:
+        if config['sparse_gradients'] == True:
+            return False, "sparse_gradients is not supported by HPU"
+
+    return True, ''
 
 def get_test_path(filename):
     curr_path = Path(__file__).parent

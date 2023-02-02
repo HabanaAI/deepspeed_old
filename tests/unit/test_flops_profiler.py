@@ -1,17 +1,18 @@
 import torch
+import os
 import pytest
 import deepspeed
-import deepspeed.runtime.utils as ds_utils
-from deepspeed.profiling.flops_profiler import FlopsProfiler, get_model_profile
-from .simple_model import SimpleModel, SimpleOptimizer, random_dataloader, args_from_dict
-from .common import distributed_test
+from deepspeed.profiling.flops_profiler import get_model_profile
+from .simple_model import SimpleModel, random_dataloader, args_from_dict
+from .common import distributed_test, is_hpu_supported
 
 TORCH_MAJOR = int(torch.__version__.split('.')[0])
 TORCH_MINOR = int(torch.__version__.split('.')[1])
 pytestmark = pytest.mark.skipif(TORCH_MAJOR < 1
                                 or (TORCH_MAJOR == 1 and TORCH_MINOR < 3),
                                 reason='requires Pytorch version 1.3 or above')
-
+if pytest.use_hpu:
+    pytest.skip("FLOPS profiler is not supported by HPU", allow_module_level=True)
 
 def within_range(val, target, tolerance):
     return abs(val - target) / target < tolerance
@@ -43,6 +44,13 @@ def test_flops_profiler_in_ds_training(tmpdir):
             "top_modules": 3,
         },
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
     model = SimpleModel(hidden_dim, empty_grad=False)

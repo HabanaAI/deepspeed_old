@@ -2,17 +2,17 @@ import copy
 
 import torch
 import torch.nn as nn
-import torch.distributed as dist
+import deepspeed.comm as dist
 
 import pytest
 
 import deepspeed
 
-from deepspeed.runtime.pipe.topology import PipeDataParallelTopology, PipeModelDataParallelTopology
+from deepspeed.runtime.pipe.topology import PipeDataParallelTopology
 
 PipeTopo = PipeDataParallelTopology
 
-from deepspeed.pipe import PipelineModule, LayerSpec
+from deepspeed.pipe import PipelineModule
 from deepspeed.utils import RepeatingLoader
 
 from .common import distributed_test
@@ -56,7 +56,7 @@ def simple_args(tmpdir):
     args = args_from_dict(tmpdir, config_dict)
     return args
 
-
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100975")
 def test_pipe_module_sequential(sequential_model, simple_args):
     batch_input = torch.randn(1, HIDDEN_DIM)
 
@@ -73,7 +73,10 @@ def test_pipe_module_sequential(sequential_model, simple_args):
 
         # Ensure all parameters are accounted for.
         my_params = sum(p.numel() for p in pipe_model.parameters())
-        total_pipe_params = torch.LongTensor([my_params]).to('cuda')
+        if pytest.use_hpu:
+            total_pipe_params = torch.LongTensor([my_params]).to('hpu')
+        else:
+            total_pipe_params = torch.LongTensor([my_params]).to('cuda')
         dist.all_reduce(total_pipe_params)
         total_pipe_params = total_pipe_params.item()
         assert total_pipe_params == base_params
@@ -84,7 +87,10 @@ def test_pipe_module_sequential(sequential_model, simple_args):
             model_parameters=[p for p in pipe_model.parameters()])
 
         if pipe_model.is_first_stage or pipe_model.is_last_stage:
-            pipe_input = base_input.clone().detach().to('cuda')
+            if pytest.use_hpu:
+                pipe_input = base_input.clone().detach().to('hpu')
+            else:
+                pipe_input = base_input.clone().detach().to('cuda')
             # label 0 is meaningless
             dataset = [(pipe_input, 0)]
             loader = RepeatingLoader(dataset)

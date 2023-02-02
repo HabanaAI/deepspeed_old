@@ -1,11 +1,12 @@
 import pytest
 from typing import Callable
 import torch
+import os
 from torch.optim import Optimizer, Adam, AdamW
 from torch.optim.lr_scheduler import _LRScheduler, LambdaLR
 
 from .simple_model import args_from_dict, SimpleModel, random_dataloader
-from .common import distributed_test
+from .common import distributed_test, is_hpu_supported
 from .util import required_torch_version
 
 import deepspeed
@@ -32,6 +33,16 @@ def test_no_optim(zero_stage, world_size):
             }
         }
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            ds_config["fp16"]["enabled"] = False
+            if ds_config['zero_optimization']['stage'] > 0:
+                ds_config["bf16"] = {"enabled" : True}
+            else:
+                ds_config["fp32"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(ds_config)
+        if not hpu_flag:
+            pytest.skip(msg)
     # 20B test
     #hidden_dim = 16 * 1024
     hidden_dim = 4
@@ -76,6 +87,12 @@ def test_client_optimizer(tmpdir, optimizer_type):
         client_optimizer = _optimizer_callable
 
     args = args_from_dict(tmpdir, config_dict)
+    if pytest.use_hpu:
+        if optimizer_type == None:
+            pytest.skip("Fused Adam related tests not supported by HPU")
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     @distributed_test(world_size=[1])
     def _test_client_optimizer(args, model, client_optimizer):

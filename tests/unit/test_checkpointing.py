@@ -1,12 +1,8 @@
-import torch
-
-import torch.distributed as dist
-
 import deepspeed
 from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
-from deepspeed.utils import groups
 from deepspeed.runtime.fp16.fused_optimizer import FP16_Optimizer
 from deepspeed.runtime.fp16.unfused_optimizer import FP16_UnfusedOptimizer
+from deepspeed.runtime.checkpoint_engine.torch_checkpoint_engine import TorchCheckpointEngine
 from deepspeed.moe.utils import split_params_into_different_moe_groups_for_optimizer
 
 from deepspeed.runtime.pipe.topology import *
@@ -16,15 +12,12 @@ PipeTopo = PipeDataParallelTopology
 from deepspeed.ops.op_builder import FusedLambBuilder, CPUAdamBuilder
 
 from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
-from .util import required_torch_version
+from .util import required_minimum_torch_version, required_torch_version
 
 import itertools
-import argparse
 import pytest
-import json
-import os
 import numbers
-from .common import distributed_test
+from .common import distributed_test, is_hpu_supported
 from .simple_model import *
 
 
@@ -49,8 +42,9 @@ def compare_model_states(saved_model,
         np1, p1 = p1
         if 'deepspeed_moe.gate.wg' in np0:
             # these params are converted to float at runtime, cast to half for comparison
-            p1 = p1.half()
-            p0 = p0.half()
+            if (not pytest.use_hpu) and (get_hpu_dev_version() == 'Gaudi'):
+                p1 = p1.half()
+                p0 = p0.half()
         assert id(p0) != id(p1), f'Comparing fp16 model state tensor against itself : {id(p0)} <====> {id(p1)}'
         try:
             assert torch.allclose(p0, p1, atol=1e-07), f"FP16 model state {p0} is not equal to {p1}, names:{np0}, {np1}"
@@ -88,18 +82,25 @@ def compare_model_states(saved_model,
         assert False, f'Unexpected Optimizer Type: {saved_model.optimizer}'
 
 
+def _compare_state_dicts(state0, state1, expected_mismatch_keys=[]):
+    for (k0, s0), (k1, s1) in zip(state0.items(), state1.items()):
+        assert k0 == k1, f'failure due to key mismatch {k0} != {k1}'
+        if k0 in expected_mismatch_keys:
+            continue
+        if isinstance(s0, torch.Tensor) and isinstance(s1, torch.Tensor):
+            assert id(s0) != id(s1), f'Comparing optimizer state tensor against itself: {id(s0)} <====> {id(s1)}'
+            assert torch.equal(s0.to('cpu'), s1.to('cpu'))
+        else:
+            assert s0 == s1, f'failures with keys = {k0}, {k1}, values = {type(s0[0])} and {type(s1[0])}'
+
+
 def compare_optimizer_states(saved_model, loaded_model, hidden_dim, fp16=True):
     saved_optimizer = saved_model.optimizer.optimizer if fp16 else saved_model.optimizer
     loaded_optimizer = loaded_model.optimizer.optimizer if fp16 else loaded_model.optimizer
 
     for state0, state1 in zip(saved_optimizer.state.values(),
                               loaded_optimizer.state.values()):
-        for s0, s1 in zip(state0.values(), state1.values()):
-            if isinstance(s0, torch.Tensor) and isinstance(s1, torch.Tensor):
-                assert id(s0) != id(s1), f'Comparing optimizer state tensor against itself: {id(s0)} <====> {id(s1)}'
-                assert torch.equal(s0, s1)
-            else:
-                assert s0 == s1
+        _compare_state_dicts(state0, state1)
 
 
 def compare_lr_scheduler_states(saved_model, loaded_model):
@@ -150,8 +151,7 @@ def checkpoint_correctness_verification(args,
                                                          None],
                                         empty_tag=False,
                                         seq_dataloader=False,
-                                        load_module_only=False):
-    dtype = torch.half if fp16 else torch.float32
+                                        load_module_only=False, dtype=torch.half):
     ds_model = create_deepspeed_model(args=args,
                                       model=models[0],
                                       base_optimizer=base_optimizers[0])
@@ -245,7 +245,15 @@ def test_checkpoint_unfused_optimizer(tmpdir):
             }
         }
     }
-
+    dtype = torch.half
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+            dtype = torch.float
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
 
@@ -256,7 +264,15 @@ def test_checkpoint_unfused_optimizer(tmpdir):
                                            models,
                                            hidden_dim,
                                            load_optimizer_states):
-        checkpoint_correctness_verification(args,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            checkpoint_correctness_verification(args,
+                                            models=models,
+                                            hidden_dim=hidden_dim,
+                                            tmpdir=tmpdir,
+                                            load_optimizer_states=load_optimizer_states,
+                                            fp16=False, dtype=dtype)
+        else:
+            checkpoint_correctness_verification(args,
                                             models=models,
                                             hidden_dim=hidden_dim,
                                             tmpdir=tmpdir,
@@ -291,6 +307,15 @@ def test_checkpoint_fused_optimizer(tmpdir):
             "enabled": True
         }
     }
+    dtype = torch.half
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+            dtype = torch.float
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
@@ -302,7 +327,15 @@ def test_checkpoint_fused_optimizer(tmpdir):
                                          models,
                                          hidden_dim,
                                          load_optimizer_states):
-        checkpoint_correctness_verification(args,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            checkpoint_correctness_verification(args,
+                                            models=models,
+                                            hidden_dim=hidden_dim,
+                                            tmpdir=tmpdir,
+                                            load_optimizer_states=load_optimizer_states,
+                                            fp16=False, dtype=dtype)
+        else:
+            checkpoint_correctness_verification(args,
                                             models=models,
                                             hidden_dim=hidden_dim,
                                             tmpdir=tmpdir,
@@ -362,6 +395,19 @@ def test_checkpoint_zero_optimizer(tmpdir, zero_stage, use_cpu_offload, adam_opt
             "cpu_offload": use_cpu_offload
         }
     }
+    dtype=torch.half
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+            dtype=torch.float
+            if config_dict['zero_optimization']['stage'] > 0:
+                config_dict["zero_allow_comm_data_type_fp32"] = True
+            if config_dict['zero_optimization']['stage'] > 1:
+                config_dict["communication_data_type"] = 'bfp16'
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
 
@@ -375,8 +421,15 @@ def test_checkpoint_zero_optimizer(tmpdir, zero_stage, use_cpu_offload, adam_opt
                 models = [SimpleModel(hidden_dim, empty_grad=False) for _ in range(2)]
         else:
             models = [SimpleModel(hidden_dim, empty_grad=False) for _ in range(2)]
-
-        checkpoint_correctness_verification(args,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            checkpoint_correctness_verification(args,
+                                            models,
+                                            hidden_dim,
+                                            tmpdir,
+                                            load_optimizer_states=load_optimizer_states,
+                                            fp16=False,dtype=dtype)
+        else:
+            checkpoint_correctness_verification(args,
                                             models,
                                             hidden_dim,
                                             tmpdir,
@@ -389,12 +442,12 @@ def test_checkpoint_zero_optimizer(tmpdir, zero_stage, use_cpu_offload, adam_opt
 
 
 @pytest.mark.parametrize('zero_stage, use_cpu_offload, adam_optimizer',
-                         [(1,
+                         [pytest.param(1,
                            False,
-                           "Adam"),
-                          (2,
+                           "Adam", marks=pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")),
+                          pytest.param(2,
                            False,
-                           "Adam"),
+                           "Adam", marks=pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")),
                           (2,
                            True,
                            'deepspeed_adam'),
@@ -432,6 +485,19 @@ def test_checkpoint_zero_no_optimizer(tmpdir,
             "cpu_offload": use_cpu_offload
         }
     }
+    dtype=torch.half
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+            dtype=torch.float
+            if config_dict['zero_optimization']['stage'] > 0:
+                config_dict["zero_allow_comm_data_type_fp32"] = True
+            if config_dict['zero_optimization']['stage'] > 1:
+                config_dict["communication_data_type"] = 'bfp16'
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
 
@@ -448,7 +514,15 @@ def test_checkpoint_zero_no_optimizer(tmpdir,
         else:
             models = [SimpleModel(hidden_dim, empty_grad=False) for _ in range(2)]
 
-        checkpoint_correctness_verification(args,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            checkpoint_correctness_verification(args,
+                                            models,
+                                            hidden_dim,
+                                            tmpdir,
+                                            load_optimizer_states=load_optimizer_states,
+                                            fp16=False,dtype=dtype)
+        else:
+            checkpoint_correctness_verification(args,
                                             models,
                                             hidden_dim,
                                             tmpdir,
@@ -464,12 +538,12 @@ def test_checkpoint_zero_no_optimizer(tmpdir,
                          [(0,
                            False,
                            'Adam'),
-                          (1,
+                          pytest.param(1,
                            False,
-                           'Adam'),
-                          (2,
+                           'Adam', marks=pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")),
+                          pytest.param(2,
                            False,
-                           'Adam'),
+                           'Adam', marks=pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")),
                           (2,
                            True,
                            'deepspeed_adam'),
@@ -512,6 +586,20 @@ def test_checkpoint_lr_scheduler(tmpdir, zero_stage, use_cpu_offload, adam_optim
             }
         }
     }
+    dtype=torch.half
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+            dtype=torch.float
+            if config_dict['zero_optimization']['stage'] > 0:
+                config_dict["zero_allow_comm_data_type_fp32"] = True
+            if config_dict['zero_optimization']['stage'] > 1:
+                config_dict["communication_data_type"] = 'bfp16'
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
+
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
 
@@ -529,7 +617,16 @@ def test_checkpoint_lr_scheduler(tmpdir, zero_stage, use_cpu_offload, adam_optim
         else:
             models = [SimpleModel(hidden_dim, empty_grad=False) for _ in range(2)]
 
-        checkpoint_correctness_verification(
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            checkpoint_correctness_verification(
+            args,
+            models,
+            hidden_dim,
+            tmpdir,
+            load_optimizer_states=load_optimizer_states,
+            load_lr_scheduler_states=load_lr_scheduler_states, fp16=False, dtype=dtype)
+        else:
+            checkpoint_correctness_verification(
             args,
             models,
             hidden_dim,
@@ -548,12 +645,12 @@ def test_checkpoint_lr_scheduler(tmpdir, zero_stage, use_cpu_offload, adam_optim
                          [(0,
                            False,
                            'Adam'),
-                          (1,
+                          pytest.param(1,
                            False,
-                           'Adam'),
-                          (2,
+                           'Adam', marks=pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")),
+                          pytest.param(2,
                            False,
-                           'Adam'),
+                           'Adam', marks=pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")),
                           (2,
                            True,
                            'deepspeed_adam'),
@@ -592,6 +689,19 @@ def test_checkpoint_no_lr_scheduler(tmpdir, zero_stage, use_cpu_offload, adam_op
             }
         },
     }
+    dtype=torch.half
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+            dtype=torch.float
+            if config_dict['zero_optimization']['stage'] > 0:
+                config_dict["zero_allow_comm_data_type_fp32"] = True
+            if config_dict['zero_optimization']['stage'] > 1:
+                config_dict["communication_data_type"] = 'bfp16'
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
 
@@ -607,7 +717,16 @@ def test_checkpoint_no_lr_scheduler(tmpdir, zero_stage, use_cpu_offload, adam_op
         else:
             models = [SimpleModel(hidden_dim, empty_grad=False) for _ in range(2)]
 
-        checkpoint_correctness_verification(
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            checkpoint_correctness_verification(
+            args,
+            models,
+            hidden_dim,
+            tmpdir,
+            load_optimizer_states=load_optimizer_states,
+            load_lr_scheduler_states=load_lr_scheduler_states, fp16=False, dtype=dtype)
+        else:
+            checkpoint_correctness_verification(
             args,
             models,
             hidden_dim,
@@ -640,6 +759,11 @@ def test_checkpoint_fp32_optimizer(tmpdir):
             "enabled": False
         }
     }
+    dtype=torch.float
+    if pytest.use_hpu:
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
@@ -652,11 +776,12 @@ def test_checkpoint_fp32_optimizer(tmpdir):
                                             models=models,
                                             hidden_dim=hidden_dim,
                                             tmpdir=tmpdir,
-                                            fp16=False)
+                                            fp16=False, dtype=dtype)
 
     _test_checkpoint_fp32_optimizer(args=args, models=models, hidden_dim=hidden_dim)
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100975")
 @pytest.mark.parametrize("zero_stage", [0, 1])
 def test_checkpoint_pipe_engine(zero_stage, tmpdir, stages=2):
     config_dict = {
@@ -692,19 +817,42 @@ def test_checkpoint_pipe_engine(zero_stage, tmpdir, stages=2):
             }
         }
     }
+    dtype = torch.half if config_dict['fp16']['enabled'] else torch.float
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+            dtype=torch.float
+            if config_dict['zero_optimization']['stage'] > 0:
+                config_dict["zero_allow_comm_data_type_fp32"] = True
+            if config_dict['zero_optimization']['stage'] > 1:
+                config_dict["communication_data_type"] = 'bfp16'
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     @distributed_test(world_size=4)
     def _test(save_folder, num_stages):
         args = args_from_dict(tmpdir, config_dict)
         models = [LinearStackPipe(num_stages=num_stages) for _ in range(2)]
-        checkpoint_correctness_verification(args=args,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            checkpoint_correctness_verification(args=args,
+                                            models=models,
+                                            hidden_dim=models[0].hidden_dim,
+                                            tmpdir=save_folder,
+                                            fp16=False,
+                                            load_optimizer_states=True,
+                                            load_lr_scheduler_states=True,
+                                            train_batch=True, dtype=dtype)
+        else:
+            checkpoint_correctness_verification(args=args,
                                             models=models,
                                             hidden_dim=models[0].hidden_dim,
                                             tmpdir=save_folder,
                                             fp16=config_dict['fp16']['enabled'],
                                             load_optimizer_states=True,
                                             load_lr_scheduler_states=True,
-                                            train_batch=True)
+                                            train_batch=True, dtype=dtype)
 
     _test(tmpdir, num_stages=stages)
 
@@ -728,13 +876,14 @@ def test_checkpoint_pipe_engine(zero_stage, tmpdir, stages=2):
 def test_checkpoint_pipe_module(base_topo, test_topo, tmpdir):
     @distributed_test(world_size=4)
     def _test(base_topo, test_topo, save_folder):
+        checkpoint_engine = TorchCheckpointEngine()
         base_model = LinearStackPipe(topology=base_topo)
-        base_model.save_state_dict(save_folder)
+        base_model.save_state_dict(save_folder, checkpoint_engine=checkpoint_engine)
 
         dist.barrier()
 
         test_model = LinearStackPipe(topology=test_topo)
-        test_model.load_state_dir(save_folder)
+        test_model.load_state_dir(save_folder, checkpoint_engine=checkpoint_engine)
 
         # Base and test can have different lengths, so make sure we map from the
         # smaller to larger model
@@ -763,6 +912,7 @@ def test_checkpoint_pipe_module(base_topo, test_topo, tmpdir):
     _test(base_topo, test_topo, save_folder=tmpdir)
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100705")
 @pytest.mark.parametrize('zero_stage', [1, 2])
 def test_checkpoint_zero_hybrid_optimizer_state(tmpdir, zero_stage):
     config_dict = {
@@ -778,6 +928,18 @@ def test_checkpoint_zero_hybrid_optimizer_state(tmpdir, zero_stage):
             "initial_scale_power": 8
         }
     }
+    dtype = torch.half
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+            if config_dict['zero_optimization']['stage'] > 1:
+                config_dict["communication_data_type"] = 'bfp16'
+            config_dict["zero_allow_comm_data_type_fp32"] = True
+            dtype = torch.float
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
@@ -789,12 +951,20 @@ def test_checkpoint_zero_hybrid_optimizer_state(tmpdir, zero_stage):
                                                      models,
                                                      optimizers,
                                                      hidden_dim):
-        checkpoint_correctness_verification(args,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            checkpoint_correctness_verification(args,
                                             models=models,
                                             base_optimizers=optimizers,
                                             hidden_dim=hidden_dim,
                                             tmpdir=tmpdir,
-                                            load_optimizer_states=True)
+                                            load_optimizer_states=True, dtype=dtype, fp16=False)
+        else:
+            checkpoint_correctness_verification(args,
+                                            models=models,
+                                            base_optimizers=optimizers,
+                                            hidden_dim=hidden_dim,
+                                            tmpdir=tmpdir,
+                                            load_optimizer_states=True, dtype=dtype)
 
     _test_checkpoint_zero_hybrid_optimizer_state(args=args,
                                                  models=models,
@@ -813,10 +983,13 @@ def test_checkpoint_latest(tmpdir):
             }
         }
     }
+    hpu_flag, msg = is_hpu_supported(config_dict)
+    if not hpu_flag:
+        pytest.skip(msg)
     hidden_dim = 10
     args = args_from_dict(tmpdir, config_dict)
     models = [SimpleModel(hidden_dim=hidden_dim) for _ in range(2)]
-
+    dtype = torch.float
     @distributed_test(world_size=[1])
     def _helper(args, models):
         checkpoint_correctness_verification(args,
@@ -826,7 +999,7 @@ def test_checkpoint_latest(tmpdir):
                                             load_optimizer_states=True,
                                             load_lr_scheduler_states=False,
                                             fp16=False,
-                                            empty_tag=True)
+                                            empty_tag=True, dtype=dtype)
 
     _helper(args, models)
 
@@ -842,6 +1015,9 @@ def test_checkpoint_missing_latest(tmpdir):
             }
         }
     }
+    hpu_flag, msg = is_hpu_supported(config_dict)
+    if not hpu_flag:
+        pytest.skip(msg)
     hidden_dim = 10
     args = args_from_dict(tmpdir, config_dict)
 
@@ -873,6 +1049,9 @@ def test_checkpoint_unique_tag(tmpdir, valid_mode):
             "tag_validation": valid_mode
         }
     }
+    hpu_flag, msg = is_hpu_supported(config_dict)
+    if not hpu_flag:
+        pytest.skip(msg)
     hidden_dim = 10
     args = args_from_dict(tmpdir, config_dict)
 
@@ -885,11 +1064,9 @@ def test_checkpoint_unique_tag(tmpdir, valid_mode):
                                              model_parameters=model.parameters())
         if valid_mode == "FAIL":
             with pytest.raises(AssertionError):
-                model.save_checkpoint(save_dir=tmpdir,
-                                      tag=f"tag-{torch.distributed.get_rank()}")
+                model.save_checkpoint(save_dir=tmpdir, tag=f"tag-{dist.get_rank()}")
         else:
-            model.save_checkpoint(save_dir=tmpdir,
-                                  tag=f"tag-{torch.distributed.get_rank()}")
+            model.save_checkpoint(save_dir=tmpdir, tag=f"tag-{dist.get_rank()}")
 
     _helper(args=args, model=model, hidden_dim=hidden_dim)
 
@@ -908,6 +1085,9 @@ def test_checkpoint_unknown_tag_validation(tmpdir):
             "tag_validation": "foo"
         }
     }
+    hpu_flag, msg = is_hpu_supported(config_dict)
+    if not hpu_flag:
+        pytest.skip(msg)
     hidden_dim = 10
     args = args_from_dict(tmpdir, config_dict)
 
@@ -935,6 +1115,15 @@ def test_checkpoint_moe(tmpdir, ep_size):
             "enabled": True
         }
     }
+    dtype=torch.half
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+            dtype=torch.float
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     hidden_dim = 16
     args = args_from_dict(tmpdir, config_dict)
 
@@ -946,7 +1135,19 @@ def test_checkpoint_moe(tmpdir, ep_size):
                            ep_size=ep_size) for _ in range(2)
         ]
         optimizers = [torch.optim.AdamW(params=model.parameters()) for model in models]
-        checkpoint_correctness_verification(args,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            checkpoint_correctness_verification(args,
+                                            models=models,
+                                            hidden_dim=hidden_dim,
+                                            tmpdir=tmpdir,
+                                            load_optimizer_states=True,
+                                            load_lr_scheduler_states=False,
+                                            fp16=False,
+                                            empty_tag=True,
+                                            base_optimizers=optimizers,
+                                            seq_dataloader=True, dtype=dtype)
+        else:
+            checkpoint_correctness_verification(args,
                                             models=models,
                                             hidden_dim=hidden_dim,
                                             tmpdir=tmpdir,
@@ -960,6 +1161,7 @@ def test_checkpoint_moe(tmpdir, ep_size):
     _helper(args)
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100705")
 @pytest.mark.parametrize("ep_size, load_optim_states",
                          [(4,
                            True),
@@ -994,6 +1196,19 @@ def test_checkpoint_moe_and_zero(tmpdir, ep_size, load_optim_states):
             "stage": 2,
         }
     }
+    dtype = torch.half
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+            dtype=torch.float
+            if config_dict['zero_optimization']['stage'] > 0:
+                config_dict["zero_allow_comm_data_type_fp32"] = True
+            if config_dict['zero_optimization']['stage'] > 1:
+                config_dict["communication_data_type"] = 'bfp16'
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     hidden_dim = 16
     args = args_from_dict(tmpdir, config_dict)
 
@@ -1014,7 +1229,19 @@ def test_checkpoint_moe_and_zero(tmpdir, ep_size, load_optim_states):
                 create_param_groups(model)) for model in models
         ]
         optimizers = [torch.optim.AdamW(params=param) for param in params]
-        checkpoint_correctness_verification(args,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            checkpoint_correctness_verification(args,
+                                            models=models,
+                                            hidden_dim=hidden_dim,
+                                            tmpdir=tmpdir,
+                                            load_optimizer_states=load_optim_states,
+                                            load_lr_scheduler_states=False,
+                                            fp16=False,
+                                            empty_tag=True,
+                                            base_optimizers=optimizers,
+                                            seq_dataloader=True, dtype=dtype)
+        else:
+            checkpoint_correctness_verification(args,
                                             models=models,
                                             hidden_dim=hidden_dim,
                                             tmpdir=tmpdir,
@@ -1028,7 +1255,10 @@ def test_checkpoint_moe_and_zero(tmpdir, ep_size, load_optim_states):
     _helper(args)
 
 
-@pytest.mark.parametrize('zero_stage', [0, 1, 2, 3])
+@pytest.mark.parametrize('zero_stage', [0,
+                                      pytest.param(1, marks=pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")),
+                                      pytest.param(2, marks=pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")),
+                                      3])
 def test_checkpoint_load_module_only(tmpdir, zero_stage):
     config_dict = {
         "train_batch_size": 2,
@@ -1043,6 +1273,19 @@ def test_checkpoint_load_module_only(tmpdir, zero_stage):
             "stage": zero_stage,
         }
     }
+    dtype = torch.half
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+            dtype=torch.float
+            if config_dict['zero_optimization']['stage'] > 0:
+                config_dict["zero_allow_comm_data_type_fp32"] = True
+            if config_dict['zero_optimization']['stage'] > 1:
+                config_dict["communication_data_type"] = 'bfp16'
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
 
@@ -1054,7 +1297,14 @@ def test_checkpoint_load_module_only(tmpdir, zero_stage):
         else:
             models = [SimpleModel(hidden_dim, empty_grad=False) for _ in range(2)]
 
-        checkpoint_correctness_verification(args,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            checkpoint_correctness_verification(args,
+                                            models,
+                                            hidden_dim,
+                                            tmpdir,
+                                            load_module_only=True, fp16=False, dtype=dtype)
+        else:
+            checkpoint_correctness_verification(args,
                                             models,
                                             hidden_dim,
                                             tmpdir,
@@ -1109,11 +1359,13 @@ def test_non_strict_load_sparse(tmpdir,
 
     @distributed_test(world_size=[2])
     def _test(model_to_save, model_destination):
+        args = args_from_dict(tmpdir, {"train_batch_size": 2, "sparse_gradients": to_save_model_sparse})
         engine_to_save, _, _, _ = deepspeed.initialize(
-            model=model_to_save, config={"train_batch_size": 2, "sparse_gradients": to_save_model_sparse}
+            model=model_to_save, args=args
         )
+        args = args_from_dict(tmpdir, {"train_batch_size": 2, "sparse_gradients": destination_sparse})
         engine_destination, _, _, _ = deepspeed.initialize(
-            model=model_destination, config={"train_batch_size": 2, "sparse_gradients": destination_sparse}
+            model=model_destination, args=args
         )
 
         save_folder = os.path.join(tmpdir, 'saved_checkpoint')
@@ -1152,6 +1404,7 @@ def test_non_strict_load_sparse(tmpdir,
     _test(model_to_save, model_destination)
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")
 @pytest.mark.parametrize(["elastic_save",
                           "elastic_load",
                           "load_optim"],
@@ -1176,15 +1429,46 @@ def test_checkpoint_zero_elastic(tmpdir, elastic_save, elastic_load, load_optim)
             "elastic_checkpoint": elastic_save
         }
     }
+    dtype=torch.half
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            ds_config["fp16"]["enabled"] = False
+            ds_config["fp32"] = {"enabled" : True}
+            dtype=torch.float
+            if ds_config['zero_optimization']['stage'] > 0:
+                ds_config["zero_allow_comm_data_type_fp32"] = True
+            if ds_config['zero_optimization']['stage'] > 1:
+                ds_config["communication_data_type"] = 'bfp16'
+        hpu_flag, msg = is_hpu_supported(ds_config)
+        if not hpu_flag:
+            pytest.skip(msg)
     hidden_dim = 10
 
     @distributed_test(world_size=[2])
     def _go():
+        # torch 1.2.* stores raw tensor id numbers in checkpoint state which leads to
+        # false positive mismatches in checkpoint state comparisons.
+        # Newer torch versions store tensor ids as 0, 1, 2, ...
+        expected_mismatch_keys = [] if required_minimum_torch_version(1,
+                                                                      4) else ['params']
         models = [SimpleModel(hidden_dim) for _ in range(2)]
-        model, _, _, _ = deepspeed.initialize(config=ds_config,
+        if pytest.use_hpu:
+            args = args_from_dict(tmpdir, ds_config)
+            model, _, _, _ = deepspeed.initialize(args=args,
                                               model=models[0],
                                               model_parameters=models[0].parameters())
-        data_loader = random_dataloader(model=model,
+        else:
+            model, _, _, _ = deepspeed.initialize(config=ds_config,
+                                              model=models[0],
+                                              model_parameters=models[0].parameters())
+
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            data_loader = random_dataloader(model=model,
+                                        total_samples=8,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device, dtype=dtype)
+        else:
+            data_loader = random_dataloader(model=model,
                                         total_samples=8,
                                         hidden_dim=hidden_dim,
                                         device=model.device)
@@ -1192,14 +1476,38 @@ def test_checkpoint_zero_elastic(tmpdir, elastic_save, elastic_load, load_optim)
             loss = model(batch[0], batch[1])
             model.backward(loss)
             model.step()
+        if load_optim:
+            torch.save(model.optimizer.optimizer.state_dict(),
+                       os.path.join(tmpdir,
+                                    'opt-state-dict'))
         model.save_checkpoint(tmpdir)
 
         ds_config["zero_optimization"]["elastic_checkpoint"] = elastic_load
-        model, _, _, _ = deepspeed.initialize(config=ds_config,
+        if pytest.use_hpu:
+            model, _, _, _ = deepspeed.initialize(args=args,
+                                              model=models[1],
+                                              model_parameters=models[1].parameters())
+        else:
+            model, _, _, _ = deepspeed.initialize(config=ds_config,
                                               model=models[1],
                                               model_parameters=models[1].parameters())
         model.load_checkpoint(tmpdir, load_optimizer_states=load_optim)
-        data_loader = random_dataloader(model=model,
+
+        if load_optim:
+            saved_sd = torch.load(os.path.join(tmpdir, 'opt-state-dict'))
+            curr_sd = model.optimizer.optimizer.state_dict()
+            for curr_param_group, saved_param_group in zip(curr_sd['param_groups'], saved_sd['param_groups']):
+                _compare_state_dicts(curr_param_group,
+                                     saved_param_group,
+                                     expected_mismatch_keys)
+
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            data_loader = random_dataloader(model=model,
+                                        total_samples=8,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device, dtype=dtype)
+        else:
+            data_loader = random_dataloader(model=model,
                                         total_samples=8,
                                         hidden_dim=hidden_dim,
                                         device=model.device)
@@ -1211,6 +1519,7 @@ def test_checkpoint_zero_elastic(tmpdir, elastic_save, elastic_load, load_optim)
     _go()
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")
 @pytest.mark.parametrize(["elastic_save",
                           "elastic_load",
                           "load_optim"],
@@ -1238,15 +1547,40 @@ def test_checkpoint_zero_elastic_dp_change(tmpdir,
             "elastic_checkpoint": elastic_save
         }
     }
+    dtype=torch.half
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            ds_config["fp16"]["enabled"] = False
+            ds_config["fp32"] = {"enabled" : True}
+            dtype=torch.float
+            if ds_config['zero_optimization']['stage'] > 0:
+                ds_config["zero_allow_comm_data_type_fp32"] = True
+            if ds_config['zero_optimization']['stage'] > 1:
+                ds_config["communication_data_type"] = 'bfp16'
+        hpu_flag, msg = is_hpu_supported(ds_config)
+        if not hpu_flag:
+            pytest.skip(msg)
     hidden_dim = 10
     models = [SimpleModel(hidden_dim) for _ in range(2)]
 
     @distributed_test(world_size=[4])
     def _go2(models):
-        model, _, _, _ = deepspeed.initialize(config=ds_config,
+        if pytest.use_hpu:
+            args = args_from_dict(tmpdir, ds_config)
+            model, _, _, _ = deepspeed.initialize(args=args,
                                               model=models[0],
                                               model_parameters=models[0].parameters())
-        data_loader = random_dataloader(model=model,
+        else:
+            model, _, _, _ = deepspeed.initialize(config=ds_config,
+                                              model=models[0],
+                                              model_parameters=models[0].parameters())
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            data_loader = random_dataloader(model=model,
+                                        total_samples=8,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device, dtype=dtype)
+        else:
+            data_loader = random_dataloader(model=model,
                                         total_samples=8,
                                         hidden_dim=hidden_dim,
                                         device=model.device)
@@ -1254,6 +1588,11 @@ def test_checkpoint_zero_elastic_dp_change(tmpdir,
             loss = model(batch[0], batch[1])
             model.backward(loss)
             model.step()
+
+        if load_optim:
+            torch.save(model.optimizer.optimizer.state_dict(),
+                       os.path.join(tmpdir,
+                                    'opt-state-dict'))
         model.save_checkpoint(tmpdir)
 
     _go2(models)
@@ -1261,7 +1600,13 @@ def test_checkpoint_zero_elastic_dp_change(tmpdir,
     @distributed_test(world_size=[2])
     def _go1(models):
         ds_config["zero_optimization"]["elastic_checkpoint"] = elastic_load
-        model, _, _, _ = deepspeed.initialize(config=ds_config,
+        if pytest.use_hpu:
+            args = args_from_dict(tmpdir, ds_config)
+            model, _, _, _ = deepspeed.initialize(args=args,
+                                              model=models[1],
+                                              model_parameters=models[1].parameters())
+        else:
+            model, _, _, _ = deepspeed.initialize(config=ds_config,
                                               model=models[1],
                                               model_parameters=models[1].parameters())
         if load_optim:
@@ -1273,7 +1618,10 @@ def test_checkpoint_zero_elastic_dp_change(tmpdir,
     _go1(models)
 
 
-@pytest.mark.parametrize('zero_stage', [0, 1, 2, 3])
+@pytest.mark.parametrize('zero_stage', [0,
+                                        pytest.param(1, marks=pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")),
+                                        pytest.param(2, marks=pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")),
+                                        3])
 def test_immediate_save_load(tmpdir, zero_stage):
     config_dict = {
         "train_batch_size": 4,
@@ -1288,6 +1636,18 @@ def test_immediate_save_load(tmpdir, zero_stage):
             "stage": zero_stage,
         }
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+            dtype=torch.float
+            if config_dict['zero_optimization']['stage'] > 0:
+                config_dict["zero_allow_comm_data_type_fp32"] = True
+            if config_dict['zero_optimization']['stage'] > 1:
+                config_dict["communication_data_type"] = 'bfp16'
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     hidden_dim = 10
     model = SimpleModel(hidden_dim)
     args = args_from_dict(tmpdir, config_dict)
@@ -1305,7 +1665,10 @@ def test_immediate_save_load(tmpdir, zero_stage):
     _test_immediate_save_load(args, model, tmpdir)
 
 
-@pytest.mark.parametrize('zero_stage', [0, 1, 2, 3])
+@pytest.mark.parametrize('zero_stage', [0,
+                                        pytest.param(1, marks=pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")),
+                                        pytest.param(2, marks=pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")),
+                                        3])
 def test_load_immediate_save(tmpdir, zero_stage):
     config_dict = {
         "train_batch_size": 4,
@@ -1320,6 +1683,17 @@ def test_load_immediate_save(tmpdir, zero_stage):
             "stage": zero_stage,
         }
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+            if config_dict['zero_optimization']['stage'] > 0:
+                config_dict["zero_allow_comm_data_type_fp32"] = True
+            if config_dict['zero_optimization']['stage'] > 1:
+                config_dict["communication_data_type"] = 'bfp16'
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     hidden_dim = 10
     model = SimpleModel(hidden_dim)
     args = args_from_dict(tmpdir, config_dict)
@@ -1328,7 +1702,10 @@ def test_load_immediate_save(tmpdir, zero_stage):
     def _test_load_immediate_save(args, model, tmpdir):
 
         # 1. pretrain a model and save it
-        dtype = torch.half
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            dtype = torch.float
+        else:
+            dtype = torch.half
         ds_model = create_deepspeed_model(args=args, model=model, base_optimizer=None)
         data_loader = random_dataloader(model=ds_model,
                                         total_samples=1,
@@ -1352,10 +1729,12 @@ def test_load_immediate_save(tmpdir, zero_stage):
     _test_load_immediate_save(args, model, tmpdir)
 
 
-@pytest.mark.parametrize('zero_stage', [0, 1, 2, 3])
+@pytest.mark.parametrize('zero_stage', [0,
+                                        pytest.param(1, marks=pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")),
+                                        pytest.param(2, marks=pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100862")),
+                                        3])
 def test_save_before_accum_grad_is_done(tmpdir, zero_stage):
     config_dict = {
-        "train_batch_size": 4,
         "optimizer": {
             "type": 'Adam'
         },
@@ -1371,6 +1750,20 @@ def test_save_before_accum_grad_is_done(tmpdir, zero_stage):
         "train_micro_batch_size_per_gpu": 1,
         "train_batch_size": 2,
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+            dtype=torch.float
+            if config_dict['zero_optimization']['stage'] > 0:
+                config_dict["zero_allow_comm_data_type_fp32"] = True
+                if config_dict['zero_optimization']['stage'] > 1:
+                    config_dict["communication_data_type"] = 'bfp16'
+            else:
+                config_dict["fp32"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     hidden_dim = 10
     model = SimpleModel(hidden_dim)
     args = args_from_dict(tmpdir, config_dict)
@@ -1383,11 +1776,15 @@ def test_save_before_accum_grad_is_done(tmpdir, zero_stage):
         # So we config grad_accum=2 and step only once and save_16bit_model
         ds_model = create_deepspeed_model(args=args, model=model, base_optimizer=None)
 
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            dtype = torch.float
+        else:
+            dtype = torch.half
         data_loader = random_dataloader(model=ds_model,
                                         total_samples=2,
                                         hidden_dim=hidden_dim,
                                         device=ds_model.device,
-                                        dtype=torch.half)
+                                        dtype=dtype)
 
         batch = next(iter(data_loader))
         loss = ds_model(batch[0], batch[1])

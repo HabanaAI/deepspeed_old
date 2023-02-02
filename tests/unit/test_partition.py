@@ -1,7 +1,7 @@
 import pytest
 
 import torch
-import torch.distributed as dist
+import deepspeed.comm as dist
 
 from deepspeed.runtime.utils import partition_uniform
 from deepspeed.runtime.utils import partition_balanced
@@ -20,8 +20,10 @@ def test_partitioned_tensor():
 
     rows = world * 4
     cols = 3
-
-    full = torch.rand(rows, cols).cuda()
+    if pytest.use_hpu:
+        full = torch.rand(rows, cols).to("hpu")
+    else:
+        full = torch.rand(rows, cols).cuda()
     dist.broadcast(full, src=0, group=group)
     part = PartitionedTensor(full, group=group)
 
@@ -42,12 +44,18 @@ def test_partitioned_tensor_meta():
     rows = world * 7
     cols = 3
 
-    full = torch.rand(rows, cols).cuda()
+    if pytest.use_hpu:
+        full = torch.rand(rows, cols).to("hpu")
+    else:
+        full = torch.rand(rows, cols).cuda()
     dist.broadcast(full, src=0, group=group)
     part = PartitionedTensor(full, group=group)
 
     my_meta = PartitionedTensor.from_meta(part.to_meta(), part.local_data, group)
-    assert torch.equal(full, my_meta.full())
+    if pytest.use_hpu:
+        assert torch.equal(full, my_meta.full("hpu"))
+    else:
+        assert torch.equal(full, my_meta.full())
 
 
 def assert_valid_partition(weights, parts, P):
@@ -137,7 +145,7 @@ def test_float_balanced():
     assert parts == [0, 3, 4, 5, 6]
 
 
-@pytest.mark.skip(reason="Variance-minimizing partitioning returns different result.")
+@pytest.mark.skipif(pytest.use_hpu != True,reason="Variance-minimizing partitioning returns different result.")
 def test_float_lastheavy():
     weights = [0., 1.1, 1.9, 3., 30.]
     P = 2

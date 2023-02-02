@@ -1,6 +1,6 @@
+import math
 import numpy as np
 import torch
-import torch.nn.functional as F
 import pytest
 import random
 import copy
@@ -14,6 +14,8 @@ from .modelingpreln import BertEncoder as BertEncoderPreln
 #    "transformer kernels are temporarily disabled because of unexplained failures",
 #    allow_module_level=True)
 
+if pytest.use_hpu:
+    pytest.skip("CUDA tests not supported by HPU", allow_module_level=True)
 
 def check_equal(first, second, atol=1e-2, verbose=False):
     diction_x = {}
@@ -121,7 +123,7 @@ class DSEncoder(nn.Module):
             num_layers = len(self.layer)
             chunk_length = math.ceil(math.sqrt(num_layers))
             while l < num_layers:
-                hidden_states = checkpoint.checkpoint(custom(l,
+                hidden_states = checkpoint.checkpoint(custom(l,  # noqa: F821
                                                              l + chunk_length),
                                                       hidden_states,
                                                       attention_mask * 1)

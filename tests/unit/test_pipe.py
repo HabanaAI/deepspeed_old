@@ -1,18 +1,16 @@
-import os
 import copy
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
+import deepspeed.comm as dist
 
 import pytest
 
 import deepspeed
 import deepspeed.runtime.utils as ds_utils
 
-
-from deepspeed.runtime.pipe.topology import PipeDataParallelTopology, PipeModelDataParallelTopology
+from deepspeed.runtime.pipe.topology import PipeDataParallelTopology
 
 PipeTopo = PipeDataParallelTopology
 from deepspeed.runtime.pipe.module import PipelineModule, LayerSpec
@@ -170,7 +168,8 @@ def train_cifar(model, args, num_steps=400, average_dp_losses=True, fp16=True, s
     return losses
 
 
-@pytest.mark.skip(reason="been seeing nondeterministic failures, skipping for now")
+@pytest.mark.skipif(pytest.use_hpu != True,reason="been seeing nondeterministic failures, skipping for now")
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100975")
 @pytest.mark.parametrize('topo',
                          [
                              PipeTopo(num_pp=1,

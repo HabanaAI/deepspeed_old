@@ -1,0 +1,9 @@
+testJobConfig:
+  test:
+    devices:
+      gaudi:
+        hwType:
+          sim:
+      gaudi2:
+        hwType:
+          sim:

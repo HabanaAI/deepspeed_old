@@ -3,18 +3,19 @@ import torch
 import pytest
 import json
 import argparse
+import os
 
 from deepspeed.runtime.zero.config import DeepSpeedZeroConfig
 
-from .common import distributed_test, get_test_path
+from .common import distributed_test, get_test_path, is_hpu_supported
 from .simple_model import SimpleModel, create_config_from_dict, random_dataloader
-import torch.distributed as dist
+import deepspeed.comm as dist
 
 # A test on its own
 import deepspeed
 from deepspeed.runtime.config import DeepSpeedConfig, get_bfloat16_enabled
 
-
+@pytest.mark.skipif(pytest.use_hpu == True, reason="Cuda specific test, Not Supported by HPU")
 def test_cuda():
     assert (torch.cuda.is_available())
 
@@ -112,6 +113,10 @@ def test_temp_config_json(tmpdir):
     config_dict = {
         "train_batch_size": 1,
     }
+    if pytest.use_hpu:
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     config_path = create_config_from_dict(tmpdir, config_dict)
     config_json = json.load(open(config_path, 'r'))
     assert 'train_batch_size' in config_json
@@ -124,11 +129,13 @@ def test_temp_config_json(tmpdir):
                          ])
 def test_gather_16bit_params_on_model_save(gather_weights_key):
     config_dict = {
-        "zero_optimization": {
-            gather_weights_key: True,
-        },
+        gather_weights_key: True,
     }
-    config = DeepSpeedZeroConfig(config_dict)
+    config = DeepSpeedZeroConfig(**config_dict)
+    if pytest.use_hpu:
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     assert config.gather_16bit_weights_on_model_save == True
 
@@ -140,6 +147,10 @@ def test_get_bfloat16_enabled(bf16_key):
             "enabled": True,
         },
     }
+    if pytest.use_hpu:
+        hpu_flag, msg = is_hpu_supported(cfg)
+        if not hpu_flag:
+            pytest.skip(msg)
     assert get_bfloat16_enabled(cfg) == True
 
 
@@ -156,12 +167,22 @@ def test_deprecated_deepscale_config(tmpdir):
             "enabled": True
         }
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     config_path = create_config_from_dict(tmpdir, config_dict)
     parser = argparse.ArgumentParser()
     args = parser.parse_args(args='')
     args.deepscale_config = config_path
     args.local_rank = 0
+    if pytest.use_hpu:
+        args.use_hpu = True
+        args.no_cuda = True
 
     hidden_dim = 10
 
@@ -172,7 +193,13 @@ def test_deprecated_deepscale_config(tmpdir):
         model, _, _,_ = deepspeed.initialize(args=args,
                                              model=model,
                                              model_parameters=model.parameters())
-        data_loader = random_dataloader(model=model,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            data_loader = random_dataloader(model=model,
+                                        total_samples=5,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device, dtype=torch.float)
+        else:
+            data_loader = random_dataloader(model=model,
                                         total_samples=5,
                                         hidden_dim=hidden_dim,
                                         device=model.device)
@@ -197,12 +224,21 @@ def test_dist_init_true(tmpdir):
             "enabled": True
         }
     }
-
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     config_path = create_config_from_dict(tmpdir, config_dict)
     parser = argparse.ArgumentParser()
     args = parser.parse_args(args='')
     args.deepscale_config = config_path
     args.local_rank = 0
+    if pytest.use_hpu:
+        args.use_hpu = True
+        args.no_cuda = True
 
     hidden_dim = 10
 
@@ -214,7 +250,13 @@ def test_dist_init_true(tmpdir):
                                              model=model,
                                              model_parameters=model.parameters(),
                                              dist_init_required=True)
-        data_loader = random_dataloader(model=model,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            data_loader = random_dataloader(model=model,
+                                        total_samples=5,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device, dtype=torch.float)
+        else:
+            data_loader = random_dataloader(model=model,
                                         total_samples=5,
                                         hidden_dim=hidden_dim,
                                         device=model.device)
@@ -229,6 +271,13 @@ def test_dist_init_true(tmpdir):
 def test_init_no_optimizer(tmpdir):
 
     config_dict = {"train_batch_size": 1, "fp16": {"enabled": True}}
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     config_path = create_config_from_dict(tmpdir, config_dict)
 
     @distributed_test(world_size=1)
@@ -237,13 +286,22 @@ def test_init_no_optimizer(tmpdir):
         args = parser.parse_args(args='')
         args.deepscale_config = config_path
         args.local_rank = 0
+        if pytest.use_hpu:
+            args.use_hpu = True
+            args.no_cuda = True
 
         hidden_dim = 10
 
         model = SimpleModel(hidden_dim=hidden_dim)
 
         model, _, _, _ = deepspeed.initialize(args=args, model=model)
-        data_loader = random_dataloader(model=model,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            data_loader = random_dataloader(model=model,
+                                        total_samples=5,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device, dtype=torch.float)
+        else:
+            data_loader = random_dataloader(model=model,
                                         total_samples=5,
                                         hidden_dim=hidden_dim,
                                         device=model.device)
@@ -257,6 +315,7 @@ def test_init_no_optimizer(tmpdir):
     _helper()
 
 
+@pytest.mark.skipif(pytest.use_hpu == True, reason="None args is not supported by HPU")
 def test_none_args(tmpdir):
     config = {
         "train_batch_size": 1,
@@ -284,7 +343,7 @@ def test_none_args(tmpdir):
 
     _helper()
 
-
+@pytest.mark.skipif(pytest.use_hpu == True, reason="no args is not supported by HPU")
 def test_no_args(tmpdir):
     config = {
         "train_batch_size": 1,
@@ -326,12 +385,27 @@ def test_no_model(tmpdir):
             "enabled": True
         }
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config["fp16"]["enabled"] = False
+            config["fp32"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     @distributed_test(world_size=1)
     def _helper():
+        if pytest.use_hpu:
+            args = args_from_dict(tmpdir, config)
         model = SimpleModel(hidden_dim=10)
         with pytest.raises(AssertionError):
-            model, _, _, _ = deepspeed.initialize(model=None, config=config)
+            if pytest.use_hpu:
+                model, _, _, _ = deepspeed.initialize(model=None, args=args)
+            else:
+                model, _, _, _ = deepspeed.initialize(model=None, config=config)
 
         with pytest.raises(AssertionError):
-            model, _, _, _ = deepspeed.initialize(model, config=config)
+            if pytest.use_hpu:
+                model, _, _, _ = deepspeed.initialize(model, args=args)
+            else:
+                model, _, _, _ = deepspeed.initialize(model, config=config)

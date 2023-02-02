@@ -1,10 +1,12 @@
 import numpy as np
 import deepspeed
 import pytest
+import os
+import torch
 from deepspeed.runtime.progressive_layer_drop import ProgressiveLayerDrop
 
-from .common import distributed_test
-from .simple_model import SimpleModel, PLD_SimpleModel, SimpleOptimizer, random_dataloader, args_from_dict
+from .common import distributed_test, is_hpu_supported
+from .simple_model import SimpleModel, PLD_SimpleModel, random_dataloader, args_from_dict
 
 
 @pytest.mark.parametrize('theta', [0, 0.1, 0.9, 1.0])
@@ -40,7 +42,13 @@ def test_pld_model(tmpdir, theta):
             "gamma": gamma
         }
     }
-
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
 
@@ -52,7 +60,13 @@ def test_pld_model(tmpdir, theta):
                                               model=model,
                                               model_parameters=model.parameters())
 
-        data_loader = random_dataloader(model=model,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            data_loader = random_dataloader(model=model,
+                                        total_samples=50,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device, dtype=torch.float)
+        else:
+            data_loader = random_dataloader(model=model,
                                         total_samples=50,
                                         hidden_dim=hidden_dim,
                                         device=model.device)
@@ -94,6 +108,13 @@ def test_non_pld_model(tmpdir):
             "gamma": gamma
         }
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
@@ -106,7 +127,13 @@ def test_non_pld_model(tmpdir):
                                               model=model,
                                               model_parameters=model.parameters())
 
-        data_loader = random_dataloader(model=model,
+        if pytest.use_hpu and os.getenv("REPLACE_FP16", default=None):
+            data_loader = random_dataloader(model=model,
+                                        total_samples=1,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device, dtype=torch.float)
+        else:
+            data_loader = random_dataloader(model=model,
                                         total_samples=1,
                                         hidden_dim=hidden_dim,
                                         device=model.device)

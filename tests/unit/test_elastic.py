@@ -1,8 +1,10 @@
 import pytest
+from copy import deepcopy
 import deepspeed
-from .common import distributed_test
+from .common import distributed_test, is_hpu_supported
 from deepspeed.git_version_info import version as ds_version
-from .simple_model import SimpleModel, SimpleOptimizer, random_dataloader, args_from_dict
+import os
+from .simple_model import SimpleModel, args_from_dict
 
 base_ds_config = {
     "elasticity": {
@@ -21,7 +23,7 @@ base_ds_config = {
 
 
 def test_basic_10k():
-    ds_config = base_ds_config.copy()
+    ds_config = deepcopy(base_ds_config)
     final_batch_size, valid_gpus = deepspeed.elasticity.compute_elastic_config(
         ds_config=ds_config,
         target_deepspeed_version=ds_version)
@@ -42,7 +44,7 @@ def test_basic_10k():
 
 
 def test_old_version():
-    ds_config = base_ds_config.copy()
+    ds_config = deepcopy(base_ds_config)
     with pytest.raises(deepspeed.elasticity.config.ElasticityError):
         final_batch_size, valid_gpus = deepspeed.elasticity.compute_elastic_config(
             ds_config=ds_config,
@@ -50,7 +52,7 @@ def test_old_version():
 
 
 def test_disabled():
-    ds_config = base_ds_config.copy()
+    ds_config = deepcopy(base_ds_config)
     ds_config['elasticity']['enabled'] = False
     with pytest.raises(deepspeed.elasticity.config.ElasticityError):
         final_batch_size, valid_gpus = deepspeed.elasticity.compute_elastic_config(
@@ -59,7 +61,7 @@ def test_disabled():
 
 
 def test_valid_world_size():
-    ds_config = base_ds_config.copy()
+    ds_config = deepcopy(base_ds_config)
     final_batch_size, valid_gpus, mbsize = deepspeed.elasticity.compute_elastic_config(
             ds_config=ds_config,
             target_deepspeed_version=ds_version,
@@ -68,7 +70,7 @@ def test_valid_world_size():
 
 
 def test_invalid_world_size():
-    ds_config = base_ds_config.copy()
+    ds_config = deepcopy(base_ds_config)
     with pytest.raises(deepspeed.elasticity.config.ElasticityIncompatibleWorldSize):
         final_batch_size, valid_gpus, mbsize = deepspeed.elasticity.compute_elastic_config(
             ds_config=ds_config,
@@ -77,15 +79,15 @@ def test_invalid_world_size():
 
 
 def test_future_elastic_version():
-    ds_config = base_ds_config.copy()
-    ds_config['elasticity']['version'] = '0.2'
+    ds_config = deepcopy(base_ds_config)
+    ds_config['elasticity']['version'] = '0.3'
     with pytest.raises(deepspeed.elasticity.config.ElasticityError):
         deepspeed.elasticity.compute_elastic_config(ds_config=ds_config,
                                                     target_deepspeed_version=ds_version)
 
 
 def test_missing_max_batch():
-    ds_config = base_ds_config.copy()
+    ds_config = deepcopy(base_ds_config)
     del ds_config['elasticity']['max_train_batch_size']
     with pytest.raises(deepspeed.elasticity.config.ElasticityError):
         deepspeed.elasticity.compute_elastic_config(ds_config=ds_config,
@@ -93,7 +95,7 @@ def test_missing_max_batch():
 
 
 def test_missing_micro_batch():
-    ds_config = base_ds_config.copy()
+    ds_config = deepcopy(base_ds_config)
     del ds_config['elasticity']['micro_batch_sizes']
     with pytest.raises(deepspeed.elasticity.config.ElasticityError):
         deepspeed.elasticity.compute_elastic_config(ds_config=ds_config,
@@ -105,6 +107,42 @@ def test_empty_config():
     with pytest.raises(deepspeed.elasticity.config.ElasticityError):
         deepspeed.elasticity.compute_elastic_config(ds_config=ds_config,
                                                     target_deepspeed_version=ds_version)
+
+
+def test_model_parallel_v1_invalid():
+    ds_config = deepcopy(base_ds_config)
+    ds_config["elasticity"]["model_parallel_size"] = 4
+    ds_config["elasticity"]["num_gpus_per_node"] = 8
+    ds_config["elasticity"]["version"] = 0.1
+
+    with pytest.raises(deepspeed.elasticity.config.ElasticityError):
+        deepspeed.elasticity.compute_elastic_config(ds_config=ds_config,
+                                                    target_deepspeed_version=ds_version)
+
+
+def test_model_parallel_v2_invalid():
+    ds_config = deepcopy(base_ds_config)
+    ds_config["elasticity"]["model_parallel_size"] = 16
+    ds_config["elasticity"]["num_gpus_per_node"] = 8
+    ds_config["elasticity"]["version"] = 0.2
+
+    with pytest.raises(deepspeed.elasticity.config.ElasticityError):
+        deepspeed.elasticity.compute_elastic_config(ds_config=ds_config,
+                                                    target_deepspeed_version=ds_version,
+                                                    world_size=16)
+
+
+def test_model_parallel_v2_valid():
+
+    ds_config = deepcopy(base_ds_config)
+    ds_config["elasticity"]["model_parallel_size"] = 4
+    ds_config["elasticity"]["num_gpus_per_node"] = 8
+    ds_config["elasticity"]["version"] = 0.2
+
+    os.environ["WORLD_SIZE"] = str(16)
+    deepspeed.elasticity.compute_elastic_config(ds_config=ds_config,
+                                                target_deepspeed_version=ds_version)
+    os.environ.pop("WORLD_SIZE")
 
 
 @pytest.mark.parametrize('key, value',
@@ -129,7 +167,7 @@ def test_empty_config():
                             0.5,
                             4])])
 def test_invalid_config_values(key, value):
-    ds_config = base_ds_config.copy()
+    ds_config = deepcopy(base_ds_config)
     ds_config['elasticity'][key] = value
     with pytest.raises(deepspeed.elasticity.config.ElasticityError):
         deepspeed.elasticity.compute_elastic_config(ds_config=ds_config,
@@ -137,7 +175,7 @@ def test_invalid_config_values(key, value):
 
 
 def test_proper_mbsz():
-    ds_config = base_ds_config.copy()
+    ds_config = deepcopy(base_ds_config)
     ds_config["elasticity"]["max_train_batch_size"] = 32
     ds_config["elasticity"]["micro_batch_sizes"] = [1, 2, 3, 7]
     ds_config["elasticity"]["min_gpus"] = 1
@@ -172,6 +210,10 @@ def test_non_elastic_batch_params(tmpdir):
             "version": 0.1
         }
     }
+    if pytest.use_hpu:
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
 
@@ -212,6 +254,10 @@ def test_non_elastic_batch_params_w_override(tmpdir):
             "ignore_non_elastic_batch_info": True
         }
     }
+    if pytest.use_hpu:
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 10
 
@@ -251,6 +297,10 @@ def test_elastic_config_changed(tmpdir):
             "ignore_non_elastic_batch_info": True
         }
     }
+    if pytest.use_hpu:
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     import json, os
     scheduler_elastic_config = config_dict.copy()
     scheduler_elastic_config["elasticity"]["max_train_batch_size"] = 27

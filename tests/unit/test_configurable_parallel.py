@@ -1,17 +1,17 @@
 import torch
 import deepspeed
 import pytest
-import os
-import time
 import random
 import numpy as np
 import torch.multiprocessing as mp
-import torch.distributed as dist
+import deepspeed.comm as dist
 from .common import distributed_test
-from .simple_model import args_from_dict, create_deepspeed_args
 from .megatron_model import get_gpt2_model, get_megatron_version
 from .megatron_model import MockGPT2ModelPipe as GPT2ModelPipe
 from deepspeed.utils import RepeatingLoader
+
+if pytest.use_hpu:
+    pytest.skip("Megatorn-LM pacakge is not supported HPU backend", allow_module_level=True)
 
 TORCH_MAJOR = int(torch.__version__.split('.')[0])
 TORCH_MINOR = int(torch.__version__.split('.')[1])
@@ -24,7 +24,8 @@ def reset_random(seed=1234):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if not pytest.use_hpu:
+        torch.cuda.manual_seed_all(seed)
 
 
 class TestConfigurableMP:
@@ -76,7 +77,10 @@ class TestConfigurableMP:
             model = self.get_deepspeed_model(model, tmpdir)
 
             model.eval()
-            baseline = model(inputs[0].cuda(), inputs[1].cuda(), inputs[2].cuda())
+            if pytest.use_hpu:
+                baseline = model(inputs[0].to('hpu'), inputs[1].to('hpu'), inputs[2].to('hpu'))
+            else:
+                baseline = model(inputs[0].cuda(), inputs[1].cuda(), inputs[2].cuda())
 
             tag = 'mp_1'
             state_dict = {}
@@ -109,8 +113,10 @@ class TestConfigurableMP:
             model = self.get_deepspeed_model(model, tmpdir)
 
             model.eval()
-
-            baseline = model(inputs[0].cuda(), inputs[1].cuda(), inputs[2].cuda())
+            if pytest.use_hpu:
+                baseline = model(inputs[0].to('hpu'), inputs[1].to('hpu'), inputs[2].to('hpu'))
+            else:
+                baseline = model(inputs[0].cuda(), inputs[1].cuda(), inputs[2].cuda())
 
             tag = 'mp_2'
             state_dict = {}
@@ -122,7 +128,10 @@ class TestConfigurableMP:
                                   load_optimizer_states=False,
                                   load_lr_scheduler_states=False)
 
-            test = model(inputs[0].cuda(), inputs[1].cuda(), inputs[2].cuda())
+            if pytest.use_hpu:
+                test = model(inputs[0].to('hpu'), inputs[1].to('hpu'), inputs[2].to('hpu'))
+            else:
+                test = model(inputs[0].cuda(), inputs[1].cuda(), inputs[2].cuda())
             assert torch.allclose(baseline, test, rtol=1.0, atol=1e-07), f"Baseline output {baseline} is not equal to save-then-load output {test}"
 
         inputs = self.get_inputs()

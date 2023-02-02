@@ -1,26 +1,21 @@
-import math
-from deepspeed.utils import groups
 import torch
-import torch.distributed as dist
 import deepspeed
-import argparse
 import pytest
 import json
 import os
-from deepspeed.ops.adam import FusedAdam
-from .common import distributed_test
-from deepspeed.ops.op_builder import CPUAdamBuilder
-from .simple_model import SimpleModel, SimplePRMoEModel, SimpleOptimizer, random_dataloader, args_from_dict, create_deepspeed_args, SimpleMoEModel, sequence_dataloader
+from .common import distributed_test, is_hpu_supported
+from .simple_model import SimplePRMoEModel, args_from_dict, SimpleMoEModel, sequence_dataloader
 from .util import required_torch_version
 
 try:
-    from apex import amp
+    from apex import amp  # noqa: F401
     _amp_available = True
 except ImportError:
     _amp_available = False
 amp_available = pytest.mark.skip(_amp_available, reason="apex/amp is not installed")
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100874")
 @pytest.mark.parametrize("ep_size, use_residual",
                          [(2,
                            True),
@@ -41,6 +36,13 @@ def test_moe(tmpdir, ep_size, use_residual):
             "enabled": True
         }
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 16
 
@@ -72,6 +74,7 @@ def test_moe(tmpdir, ep_size, use_residual):
               use_residual=use_residual)
 
 
+@pytest.mark.xfail(pytest.use_hpu == True, reason="xfail, due to SW-100874")
 @pytest.mark.parametrize("ep_size, use_residual", [(2, True), (2, False)])
 def test_pr_moe(tmpdir, ep_size, use_residual):
     if not required_torch_version():
@@ -84,6 +87,13 @@ def test_pr_moe(tmpdir, ep_size, use_residual):
             "enabled": True
         }
     }
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["fp32"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 16
 

@@ -9,6 +9,8 @@ from deepspeed.ops.op_builder import CPUAdagradBuilder
 if not deepspeed.ops.__compatible_ops__[CPUAdagradBuilder.NAME]:
     pytest.skip("cpu-adagrad is not compatible")
 
+if pytest.use_hpu:
+    pytest.skip("DeepSpeed CPUAdagrad is not Supported by HPU", allow_module_level=True)
 
 def check_equal(first, second, atol=1e-2, verbose=False):
     x = first.detach().numpy()

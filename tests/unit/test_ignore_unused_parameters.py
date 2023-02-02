@@ -1,9 +1,8 @@
-import torch
 import pytest
 import json
 import argparse
 import os
-from .common import distributed_test
+from .common import distributed_test, is_hpu_supported
 from .simple_model import UnusedParametersModel, random_dataloader, args_from_dict
 from deepspeed.ops.op_builder import CPUAdamBuilder
 
@@ -37,7 +36,13 @@ def test_stage2_ignore_unused_parameters(tmpdir, ignore_unused_parameters):
             "initial_scale_power": 8
         }
     }
-
+    if pytest.use_hpu:
+        if os.getenv("REPLACE_FP16", default=None):
+            config_dict["fp16"]["enabled"] = False
+            config_dict["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config_dict)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = args_from_dict(tmpdir, config_dict)
     hidden_dim = 4
 
