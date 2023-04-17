@@ -22,6 +22,7 @@ ZeRO optimization should be enabled as:
     "stage3_max_reuse_distance" : 1000000000,
     "allgather_partitions": [true|false],
     "allgather_bucket_size": 500000000,
+    "max_group_size": 4e9,
     "reduce_scatter": [true|false],
     "contiguous_gradients" : [true|false]
     "overlap_comm": [true|false],
@@ -50,6 +51,10 @@ def read_zero_config_deprecated(param_dict):
             param_dict,
             "allgather_size",
             5e8)
+        zero_config_dict["max_group_size"] = get_scalar_param(
+            param_dict,
+            "max_group_size",
+            4e9)
     logger.warning(
         "DeepSpeedConfig: this format of ZeRO optimization setup is deprecated. Please use the following format: {}"
         .format(ZERO_FORMAT))
@@ -120,6 +125,9 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     """
     Attempts to overlap the reduction of the gradients with backward computation
     """
+
+    # TODO SW-97921: remove this WA code when SW-97305 is resolved
+    max_group_size:int = Field(4e9, ge=0)
 
     load_from_fp32_weights: bool = True
     """
@@ -258,12 +266,14 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     """
 
     round_robin_gradients: bool = False
+
     """
     Stage 1 and 2 optimization for CPU offloading that parallelizes gradient
     copying to CPU memory among ranks by fine-grained gradient partitioning.
     Performance benefit grows with gradient accumulation steps (more copying
     between optimizer steps) or GPU count (increased parallelism).
     """
+
 
     # Validators
     @validator("overlap_comm")

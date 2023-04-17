@@ -1,0 +1,9 @@
+{
+    "optimizer": {
+      "type": "adam",
+      "params": {
+        "adam_w_mode": false
+      }
+    },
+    "train_batch_size": 2
+}

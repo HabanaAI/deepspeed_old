@@ -1,0 +1,28 @@
+{
+  "optimizer": {
+    "type": "adamw"
+  },
+  "steps_per_print": 1,
+  "train_batch_size": 8,
+  "train_micro_batch_size_per_gpu": 2,
+  "scheduler": {
+    "type": "WarmupDecayLR",
+    "params": {
+      "warmup_min_lr": 0.02,
+      "warmup_max_lr": 0.05,
+      "warmup_num_steps": 4,
+      "total_num_steps" : 8,
+      "warmup_type": "linear"
+    }
+  },
+  "bf16": {
+    "enabled": true
+  },
+  "fp16": {
+    "enabled": false
+  },
+  "zero_optimization": {
+    "stage": 1
+  },
+  "gradient_clipping" : 0.0
+}

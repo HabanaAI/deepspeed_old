@@ -1,0 +1,6 @@
+{
+    "optimizer": {
+      "type": "adam"
+    },
+    "train_batch_size": 2
+}

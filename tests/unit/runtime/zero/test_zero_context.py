@@ -9,6 +9,7 @@ from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus, partiti
 import deepspeed.comm as dist
 
 from unit.common import DistributedTest, get_master_port
+from unit.hpu import *
 
 
 def setup_serial_env():
@@ -18,8 +19,11 @@ def setup_serial_env():
     os.environ['LOCAL_RANK'] = '0'
     os.environ['RANK'] = '0'
     os.environ['WORLD_SIZE'] = '1'
+    if bool(pytest.use_hpu) == True:
+        import habana_frameworks.torch.hpu
 
 
+@pytest.mark.xfail(bool(pytest.use_hpu) == True, reason="xfail, due to SW-101073")
 def test_scattered_init_dist():
     setup_serial_env()
     assert not dist.is_initialized()
@@ -27,6 +31,7 @@ def test_scattered_init_dist():
         assert dist.is_initialized()
 
 
+@pytest.mark.xfail(bool(pytest.use_hpu) == True, reason="xfail, due to SW-101073")
 class TestScatterGather(DistributedTest):
     world_size = 2
 
@@ -46,6 +51,7 @@ class TestScatterGather(DistributedTest):
             assert l.weight.numel() == l.in_features * l.out_features
 
 
+@pytest.mark.xfail(bool(pytest.use_hpu) == True, reason="xfail, due to SW-101073")
 class TestGatherUpdate(DistributedTest):
     world_size = 2
 
@@ -108,8 +114,17 @@ def test_ext_param_getattr():
             return C.sum()
 
     net = ExtLinear()
-
+    if bool(pytest.use_hpu) == True:
+        if os.getenv("REPLACE_FP16", default=None):
+            config["fp16"]["enabled"] = False
+            config["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = SimpleNamespace(local_rank=0)
+    if bool(pytest.use_hpu) == True:
+        args.use_hpu = True
+
     engine, optim, _, _ = deepspeed.initialize(args=args,
                                                model=net,
                                                model_parameters=net.parameters(),
@@ -124,6 +139,7 @@ def test_ext_param_getattr():
     engine.step()
 
 
+@pytest.mark.xfail(bool(pytest.use_hpu) == True, reason="xfail, due to SW-101073")
 def test_scatter_halftype():
     setup_serial_env()
 
@@ -213,8 +229,17 @@ def test_ext_param_return():
     setup_serial_env()
 
     net = DanglingExt()
+    if bool(pytest.use_hpu) == True:
+        if os.getenv("REPLACE_FP16", default=None):
+            config["fp16"]["enabled"] = False
+            config["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     args = SimpleNamespace(local_rank=0)
+    if bool(pytest.use_hpu) == True:
+        args.use_hpu = True
     engine, optim, _, _ = deepspeed.initialize(args=args,
                                                model=net,
                                                model_parameters=net.parameters(),
@@ -227,14 +252,23 @@ def test_ext_param_return():
         engine.step()
 
 
-@pytest.mark.skip('WIP')
+@pytest.mark.skip(reason='WIP')
 def test_ext_param_returnobj():
     setup_serial_env()
     print()
 
     net = ModelContainer(return_obj=True)
+    if bool(pytest.use_hpu) == True:
+        if os.getenv("REPLACE_FP16", default=None):
+            config["fp16"]["enabled"] = False
+            config["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     args = SimpleNamespace(local_rank=0)
+    if bool(pytest.use_hpu) == True:
+        args.use_hpu = True
     engine, optim, _, _ = deepspeed.initialize(args=args,
                                                model=net,
                                                model_parameters=net.parameters(),
@@ -270,8 +304,17 @@ def test_stage_3_output_type(output_type):
     print()
 
     net = ModelContainerVariableOutputType(output_type=output_type)
+    if bool(pytest.use_hpu) == True:
+        if os.getenv("REPLACE_FP16", default=None):
+            config["fp16"]["enabled"] = False
+            config["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     args = SimpleNamespace(local_rank=0)
+    if bool(pytest.use_hpu) == True:
+        args.use_hpu = True
     engine, optim, _, _ = deepspeed.initialize(args=args,
                                                model=net,
                                                model_parameters=net.parameters(),
@@ -308,6 +351,7 @@ class ConvNet(torch.nn.Module):
         return x
 
 
+@pytest.mark.xfail(bool(pytest.use_hpu) == True, reason="xfail, due to SW-101073")
 def test_subclass_param():
     setup_serial_env()
     with deepspeed.zero.Init(config=config):
@@ -348,6 +392,7 @@ class Son(Pa):
                                    1).data  # test param is not yet partitioned
 
 
+@pytest.mark.xfail(bool(pytest.use_hpu) == True, reason="xfail, due to SW-101073")
 def test_subclass_param_init():
     setup_serial_env()
     with deepspeed.zero.Init(config=config):
@@ -366,6 +411,7 @@ def test_subclass_param_init():
         assert torch.equal(model.param_grandpa, ones + 3)
 
 
+@pytest.mark.xfail(bool(pytest.use_hpu) == True, reason="xfail, due to SW-101073")
 class TestDSInitWZinit(DistributedTest):
     world_size = 2
 

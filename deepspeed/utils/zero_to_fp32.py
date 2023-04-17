@@ -181,6 +181,11 @@ def _get_fp32_state_dict_from_zero_checkpoint(ds_checkpoint_dir):
                                                           buffers)
 
 
+def _has_callable(obj, fn):
+    attr = getattr(obj, fn, None)
+    return callable(attr)
+
+
 def _get_fp32_state_dict_from_zero2_checkpoint(world_size,
                                                param_shapes,
                                                fp32_flat_groups,
@@ -233,7 +238,7 @@ def _get_fp32_state_dict_from_zero2_checkpoint(world_size,
         avail_numel = full_single_fp32_vector.numel()
         for name, shape in shapes.items():
 
-            unpartitioned_numel = shape.numel()
+            unpartitioned_numel = shape.numel() if _has_callable(shape, 'numel') else math.prod(shape)
             total_numel += unpartitioned_numel
             total_params += 1
 

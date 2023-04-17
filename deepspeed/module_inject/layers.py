@@ -4,6 +4,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from torch.nn.parameter import Parameter
+from ..runtime.utils import get_use_hpu
 
 
 class LinearAllreduce(nn.Module):
@@ -16,14 +17,15 @@ class LinearAllreduce(nn.Module):
     def forward(self, input):
         output = torch.matmul(input, self.weight.transpose(-1, -2))
         if self.mp_group is not None:
-            dist.all_reduce(output, group=self.mp_group)
+            async_op = get_use_hpu()
+            dist.all_reduce(output, group=self.mp_group, async_op=async_op)
         if self.bias is not None:
             output += self.bias
         return output
 
 
 class LinearLayer(nn.Module):
-    def __init__(self, weight_shape=None, dtype=torch.half, weight=None, bias=None):
+    def __init__(self, weight_shape=None, dtype=torch.half, weight=None, bias=None, device=None):
         super(LinearLayer, self).__init__()
         if weight is not None:
             self.weight = weight
@@ -32,13 +34,11 @@ class LinearLayer(nn.Module):
             self.weight = Parameter(
                 torch.empty(weight_shape,
                             dtype=dtype,
-                            device=torch.cuda.current_device()))
-
+                            device=device))
             self.bias = Parameter(
                 torch.empty(weight_shape[0],
                             dtype=dtype,
-                            device=torch.cuda.current_device())) \
-                if bias is not None else None
+                            device=device))
 
     def forward(self, input):
         output = torch.matmul(input, self.weight.transpose(-1, -2))
@@ -48,9 +48,9 @@ class LinearLayer(nn.Module):
 
 
 class Normalize(nn.Module):
-    def __init__(self, dim, dtype=torch.float, eps=1e-5):
+    def __init__(self, dim, dtype=torch.float, eps=1e-5, device=None):
         super(Normalize, self).__init__()
-        self.norm = nn.LayerNorm(dim, eps=eps).to(dtype).to(torch.cuda.current_device())
+        self.norm = nn.LayerNorm(dim, eps=eps).to(dtype).to(device)
         self.weight = self.norm.weight
         self.bias = self.norm.bias
 
@@ -59,13 +59,13 @@ class Normalize(nn.Module):
 
 
 class EmbeddingLayer(nn.Module):
-    def __init__(self, weight_shape, dtype=torch.half):
+    def __init__(self, weight_shape, dtype=torch.half,device=None):
         super(EmbeddingLayer, self).__init__()
         self.weight = Parameter(
             torch.empty(weight_shape[0],
                         weight_shape[1],
                         dtype=dtype,
-                        device=torch.cuda.current_device()))
+                        device=device))
 
     def forward(self, input):
         return F.embedding(input, self.weight)
@@ -75,11 +75,11 @@ class OPTEmbedding(EmbeddingLayer):
     """
     This module learns positional embeddings up to a fixed maximum size.
     """
-    def __init__(self, weight_shape):
+    def __init__(self, weight_shape, device=None):
         # OPT is set up so that if padding_idx is specified then offset the embedding ids by 2
         # and adjust num_embeddings appropriately. Other models don't have this hack
         self.offset = 2
-        super().__init__(weight_shape)
+        super().__init__(weight_shape, device=device)
 
     def forward(self, attention_mask: torch.LongTensor, past_key_values_length: int = 0):
         """`input_ids_shape` is expected to be [bsz x seqlen]."""

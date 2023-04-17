@@ -16,6 +16,10 @@ pytestmark = pytest.mark.skipif(
     TORCH_MAJOR < 1 or (TORCH_MAJOR == 1 and TORCH_MINOR < 5),
     reason='Megatron-LM package requires Pytorch version 1.5 or above')
 
+pytestmark = pytest.mark.skipif(
+    bool(pytest.use_hpu) == True,
+    reason="Megatorn-LM pacakge is not supported HPU backend")
+
 
 def get_deepspeed_model(model):
     ds_config_dict = {
@@ -31,7 +35,10 @@ def get_deepspeed_model(model):
     model, _, _,_ = deepspeed.initialize(model=model,
                                          model_parameters=model.parameters(),
                                          config=ds_config_dict)
-    return model.cuda()
+    if bool(pytest.use_hpu) == True:
+       return model.to('hpu')
+    else:
+       return model.cuda()
 
 
 def get_topology(mp, pp, world_size):
@@ -50,7 +57,8 @@ class ConfigurablePP(DistributedTest):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+        if not bool(pytest.use_hpu) == True:
+            torch.cuda.manual_seed_all(seed)
 
     @pytest.fixture
     def inputs(self, bs=1, seq_len=1, hidden_size=128):
@@ -146,7 +154,10 @@ class _baseline(DistributedFixture):
         model = get_deepspeed_model(gpt2_pipe_model)
 
         with torch.no_grad():
-            inputs = [x.cuda() for x in inputs]
+            if bool(pytest.use_hpu) == True:
+                inputs = [x.to('hpu') for x in inputs]
+            else:
+                inputs = [x.cuda() for x in inputs]
             if model.is_first_stage() or model.is_last_stage():
                 loader = RepeatingLoader([(inputs[0], 0)])
                 data_iter = iter(loader)
@@ -206,7 +217,10 @@ class TestConfigurableResizePP(ConfigurablePP):
             model.load_checkpoint(class_tmpdir,
                                   load_optimizer_states=False,
                                   load_lr_scheduler_states=False)
-            inputs = [x.cuda() for x in inputs]
+            if bool(pytest.use_hpu) == True:
+                inputs = [x.to('hpu') for x in inputs]
+            else:
+                inputs = [x.cuda() for x in inputs]
             if model.is_first_stage() or model.is_last_stage():
                 loader = RepeatingLoader([(inputs[0], 0)])
                 data_iter = iter(loader)

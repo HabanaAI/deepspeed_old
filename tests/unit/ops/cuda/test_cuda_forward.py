@@ -10,6 +10,11 @@ from unit.modeling import BertLayerNorm, BertConfig, BertEncoder as BertEncoderP
 from deepspeed import DeepSpeedTransformerLayer, DeepSpeedTransformerConfig
 
 
+pytestmark = pytest.mark.skipif(
+    bool(pytest.use_hpu) == True,
+    reason="CUDA tests not supported by HPU")
+
+
 def check_equal(first, second, atol=1e-2, verbose=False):
     if verbose:
         print()

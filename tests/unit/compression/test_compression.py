@@ -223,6 +223,7 @@ class TestCompression:
         assert isinstance(compressed_model.layer[0].attention.self.value,
                           LinearLayer_Compress)
 
+    @pytest.mark.skipif(bool(pytest.use_hpu) == True, reason="HPU not supported Megatron, Megatron requires CUDA.")
     def test_mpu_compress(self, tmpdir):
         from megatron import mpu
         args_defaults = {

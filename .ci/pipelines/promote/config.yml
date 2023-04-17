@@ -1,0 +1,10 @@
+orchestratorConfig:
+  cron: "H H/4 * * *"
+  testConfig:
+  - testToLaunch: deepspeed_fork/Tests/Test_deepspeed_fork_gaudi2_sim_test
+  - testToLaunch: deepspeed_fork/Tests/Test_deepspeed_fork_gaudi_sim_test
+  - testToLaunch: deepspeed_fork/Tests/Test_deepspeed_fork_gaudi_sim_unit_tests_promote
+    silentMode: true
+  - testToLaunch: deepspeed_fork/Tests/Test_deepspeed_fork_gaudi2_asic_unit_tests_promote
+stepConfig:
+  jobTimeout: '500'

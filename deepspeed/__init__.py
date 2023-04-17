@@ -204,6 +204,15 @@ def _add_core_arguments(parser):
         "Run via MPI, this will attempt to discover the necessary variables to initialize torch "
         "distributed from the MPI environment")
 
+    parser.add_argument("--use_hpu",
+                        default=False,
+                        action="store_true",
+                        help="Run on HPU device")
+
+    parser.add_argument("--no_cuda",
+                        action='store_true',
+                        help="Whether to use CPU when available")
+
     return parser
 
 

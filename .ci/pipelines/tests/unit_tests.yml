@@ -1,0 +1,80 @@
+common:
+  config:
+    testCommand: run_deepspeed_fork_unit_tests
+    loadLKD: true
+    releaseFlag: false
+    testXMLOutputKey: -x
+    requirementsFile: requirements.txt
+  preTestStages:
+      Update PyTorch module:
+        command: |
+          __clean_pytorch_dev_py_deps
+          $__pip_cmd install -U $PYTORCH_FORK_RELEASE_BUILD/pkgs/*.whl ${user_install}
+          $__pip_cmd install -U $PYTORCH_VISION_FORK_BUILD/pkgs/*.whl ${user_install}
+          install_pillow_simd
+          $__pip_cmd install -U $PYTORCH_MODULES_RELEASE_BUILD/pkgs/*.whl
+          build_deepspeed_fork
+          install_deepspeed_unit_test_requirements
+testsMap:
+  Test_deepspeed_fork_gaudi_sim_unit_tests_ci:
+    envVars:
+      HUGGINGFACE_HUB_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/hub/"
+      TRANSFORMERS_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/hub/"
+      PYTORCH_PRETRAINED_BERT_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/hub/"
+      PYTORCH_TRANSFORMERS_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/hub/"
+      HF_MODULES_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/"
+      HF_HOME: "/qa/data/deepspeed_inference_pretrained_models/huggingface/"
+      HF_DATASETS_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    config:
+      lkdSimHealtcheckParams:
+        lkdParam: timeout_locked=1000
+        numOfSimInstances: 2
+    stages:
+      Run deepspeed-fork unit_tests ci gaudi sim:
+        filter: -m hpu_ci --output_dir /tmp/deepspeed_fork_training_unit_tests --use_hpu
+  Test_deepspeed_fork_gaudi_sim_unit_tests_promote:
+    envVars:
+      HUGGINGFACE_HUB_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/hub/"
+      TRANSFORMERS_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/hub/"
+      PYTORCH_PRETRAINED_BERT_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/hub/"
+      PYTORCH_TRANSFORMERS_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/hub/"
+      HF_MODULES_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/"
+      HF_HOME: "/qa/data/deepspeed_inference_pretrained_models/huggingface/"
+      HF_DATASETS_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    config:
+      lkdSimHealtcheckParams:
+        lkdParam: timeout_locked=1000
+        numOfSimInstances: 2
+    stages:
+      Run deepspeed-fork unit_tests promote gaudi sim:
+        filter: -m "hpu_promote or hpu_ci" --output_dir /tmp/deepspeed_fork_training_unit_tests --use_hpu
+  Test_deepspeed_fork_gaudi2_asic_unit_tests_ci:
+    envVars:
+      SCAL_TIMEOUT_VALUE_SECONDS: "400"
+      HUGGINGFACE_HUB_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/hub/"
+      TRANSFORMERS_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/hub/"
+      PYTORCH_PRETRAINED_BERT_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/hub/"
+      PYTORCH_TRANSFORMERS_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/hub/"
+      HF_MODULES_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/"
+      HF_HOME: "/qa/data/deepspeed_inference_pretrained_models/huggingface/"
+      HF_DATASETS_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    stages:
+      Run deepspeed-fork unit_tests ci gaudi2 asic:
+        filter: -m hpu_ci --output_dir /tmp/deepspeed_fork_training_unit_tests --use_hpu
+  Test_deepspeed_fork_gaudi2_asic_unit_tests_promote:
+    envVars:
+      SCAL_TIMEOUT_VALUE_SECONDS: "400"
+      HUGGINGFACE_HUB_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/hub/"
+      TRANSFORMERS_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/hub/"
+      PYTORCH_PRETRAINED_BERT_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/hub/"
+      PYTORCH_TRANSFORMERS_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/hub/"
+      HF_MODULES_CACHE: "/qa/data/deepspeed_inference_pretrained_models/huggingface/"
+      HF_HOME: "/qa/data/deepspeed_inference_pretrained_models/huggingface/"
+      HF_DATASETS_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    stages:
+      Run deepspeed-fork unit_tests promote gaudi2 asic:
+        filter: -m "hpu_promote or hpu_ci" --output_dir /tmp/deepspeed_fork_training_unit_tests --use_hpu

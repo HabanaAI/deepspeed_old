@@ -22,8 +22,10 @@ class TestPartitionedTensor(DistributedTest):
 
         rows = world * 4
         cols = 3
-
-        full = torch.rand(rows, cols).cuda()
+        if bool(pytest.use_hpu) == True:
+           full = torch.rand(rows, cols).to("hpu")
+        else:
+            full = torch.rand(rows, cols).cuda()
         dist.broadcast(full, src=0, group=group)
         part = PartitionedTensor(full, group=group)
 
@@ -45,13 +47,18 @@ class TestPartitionedTensorMeta(DistributedTest):
 
         rows = world * 7
         cols = 3
-
-        full = torch.rand(rows, cols).cuda()
+        if bool(pytest.use_hpu) == True:
+            full = torch.rand(rows, cols).to("hpu")
+        else:
+            full = torch.rand(rows, cols).cuda()
         dist.broadcast(full, src=0, group=group)
         part = PartitionedTensor(full, group=group)
 
         my_meta = PartitionedTensor.from_meta(part.to_meta(), part.local_data, group)
-        assert torch.equal(full, my_meta.full())
+        if bool(pytest.use_hpu) == True:
+            assert torch.equal(full, my_meta.full(device='hpu'))
+        else:
+            assert torch.equal(full, my_meta.full())
 
 
 def assert_valid_partition(weights, parts, P):

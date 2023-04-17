@@ -2,9 +2,12 @@ import os
 import pytest
 import torch
 import deepspeed
+import transformers.models.bloom.modeling_bloom as modeling_bloom
 from deepspeed.model_implementations import DeepSpeedTransformerInference
 from transformers import AutoConfig, AutoModelForCausalLM
 from unit.common import DistributedTest, DistributedFixture
+from deepspeed.module_inject.layers import LinearLayer, Normalize, LinearAllreduce, EmbeddingLayer
+from unit.hpu import *
 
 
 def check_dtype(model, expected_dtype):
@@ -12,6 +15,8 @@ def check_dtype(model, expected_dtype):
         for child in module.children():
             if isinstance(child, DeepSpeedTransformerInference):
                 return child.attention.attn_qkvw.dtype
+            if isinstance(child, (LinearLayer, LinearAllreduce, Normalize, EmbeddingLayer)) and bool(pytest.use_hpu) == True:
+                return child.weight.dtype
             else:
                 found_dtype = find_dtype(child)
                 if found_dtype:
@@ -43,6 +48,11 @@ class save_shard(DistributedFixture):
     world_size = 2
 
     def run(self, model_name, class_tmpdir):
+        if bool(pytest.use_hpu) == True:
+            # FP16 is not supported on Gaudi1.
+            if get_hpu_dev_version() == "Gaudi":
+                pytest.skip(f"FP16 tests are not supported by Gaudi1.")
+
         # Only write a checkpoint if one does not exist
         if not os.path.isdir(os.path.join(class_tmpdir, model_name)):
             world_size = int(os.getenv("WORLD_SIZE", "1"))
@@ -61,7 +71,15 @@ class save_shard(DistributedFixture):
             # Load model and save sharded checkpoint
             model = AutoModelForCausalLM.from_pretrained(model_name,
                                                          torch_dtype=torch.float16)
-            model = deepspeed.init_inference(model, config=inf_config)
+            if bool(pytest.use_hpu) == True:
+                import deepspeed.module_inject as module_inject
+                inf_config["replace_with_kernel_inject"] = False
+                inj_policy = {"BertLayer": (module_inject.HFBertLayerPolicy,)}
+                if model_name == "bigscience/bloom-560m":
+                    inj_policy = {modeling_bloom.BloomBlock: ("self_attention.dense", "mlp.dense_4h_to_h")}
+                model = deepspeed.init_inference(model, config=inf_config, injection_policy=inj_policy)
+            else:
+                model = deepspeed.init_inference(model, config=inf_config)
 
 
 @pytest.mark.seq_inference
@@ -69,6 +87,7 @@ class TestCheckpointShard(DistributedTest):
     world_size = 2
 
     def test(self, model_name, dtype, class_tmpdir, save_shard):
+
         world_size = int(os.getenv("WORLD_SIZE", "1"))
         inf_config = {
             "replace_with_kernel_inject": True,
@@ -90,5 +109,13 @@ class TestCheckpointShard(DistributedTest):
             model = AutoModelForCausalLM.from_config(model_config,
                                                      torch_dtype=torch.bfloat16)
         model = model.eval()
-        model = deepspeed.init_inference(model, config=inf_config)
+        if bool(pytest.use_hpu) == True:
+            import deepspeed.module_inject as module_inject
+            inj_policy = {"BertLayer": (module_inject.HFBertLayerPolicy,)}
+            if model_name == "bigscience/bloom-560m":
+                inj_policy = {modeling_bloom.BloomBlock: ("self_attention.dense", "mlp.dense_4h_to_h")}
+            inf_config["replace_with_kernel_inject"] = False
+            model = deepspeed.init_inference(model, injection_policy=inj_policy, config=inf_config)
+        else:
+            model = deepspeed.init_inference(model, config=inf_config)
         check_dtype(model, dtype)

@@ -2,6 +2,9 @@ import torch
 import pytest
 from deepspeed.ops import op_builder
 
+pytestmark = pytest.mark.skipif(
+    ((bool(pytest.use_hpu) == True)),
+    reason="Quantization is not supported by HPU.")
 quantizer_cuda_module = None
 
 

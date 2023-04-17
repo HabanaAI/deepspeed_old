@@ -1,0 +1,14 @@
+launchers:
+- testToLaunch: deepspeed_fork/Tests/Test_deepspeed_fork_gaudi_sim_test
+  gerritTriggerMap:
+  - repository: deepspeed-fork
+- testToLaunch: deepspeed_fork/Tests/Test_deepspeed_fork_gaudi2_sim_test
+  gerritTriggerMap:
+  - repository: deepspeed-fork
+- testToLaunch: deepspeed_fork/Tests/Test_deepspeed_fork_gaudi_sim_unit_tests_ci
+  silentMode: true
+  gerritTriggerMap:
+  - repository: deepspeed-fork
+- testToLaunch: deepspeed_fork/Tests/Test_deepspeed_fork_gaudi2_asic_unit_tests_ci
+  gerritTriggerMap:
+  - repository: deepspeed-fork

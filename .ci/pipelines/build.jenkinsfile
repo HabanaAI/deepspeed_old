@@ -1,0 +1,67 @@
+def stableBranch = GERRIT_BRANCH - '_next'
+src = library("pipeline-library@$stableBranch")
+
+def user_install = env.runInDocker == 'true' ? '' : '--user'
+def preBuildStages = [
+    'Clean Old .whl pakages': { util ->
+        util.runShellCommandWrapper('rm -rf ${PYTORCH_FORK_ROOT}/dist/*.whl')
+        util.runShellCommandWrapper('rm -rf ${PYTORCH_VISION_FORK_ROOT}/dist/*.whl')
+        util.runShellCommandWrapper('rm -rf ${PYTORCH_MODULES_ROOT_PATH}/dist/*.whl')
+    },
+    'Install pytorch wheels': { util ->
+        util.runShellCommandWrapper("""
+            set -xe
+            pip install -U \${PYTORCH_FORK_RELEASE_BUILD}/pkgs/*torch*.whl ${user_install}
+        """)
+    }
+]
+
+def buildDependencies = ['PYTORCH_MODULES']
+def testDependencies = [
+    'HCL',
+    'CORAL_SIM',
+    'TPCSIM',
+    'PYTORCH_MODULES',
+    'SYNAPSE',
+    'SYNAPSE_UTILS',
+    'SWTOOLS_SDK',
+    'CORAL_SIM',
+    'TPC_KERNELS',
+    'TPC_FUSER',
+    'TPC_LLVM',
+    'SYNAPSE_PROFILER',
+    'HL_THUNK'
+]
+
+def buildCommands = [
+    'deepspeed': [
+        'command': 'build_deepspeed_fork'
+    ]
+]
+def requiredArtifact = [
+    'PYTORCH': ['test', 'data'],
+    'HCL': ['test', 'shared'],
+    'CORAL_SIM': ['test', 'shared', 'bin', 'header'],
+    'SYNAPSE': ['test', 'shared'],
+    "SYNAPSE_UTILS" : ["shared"],
+    'SWTOOLS_SDK': ['shared'],
+    'TPCSIM': ['shared', 'header'],
+    'SYNAPSE_PROFILER': ['bin', 'shared'],
+    'HL_THUNK': ['test', 'shared'],
+    'SCAL': ['test', 'shared', 'header'],
+    'ELFTOOLS': ['bin', 'shared'],
+    'TPC_KERNELS': ['test', 'shared'],
+    'TPC_FUSER': ['bin', 'shared'],
+    'TPC_LLVM': ['bin', 'bin_generic', 'util', 'shared'],
+    'ENGINES_FW': ['test', 'shared', 'config', 'data']
+]
+
+genericBuilder(
+    src: src,
+    preBuildStages: preBuildStages,
+    requiredArtifact: requiredArtifact,
+    buildCommands: buildCommands,
+    testDependencies: testDependencies,
+    buildDependencies: buildDependencies,
+    manifest: manifest
+)

@@ -9,8 +9,8 @@ import deepspeed
 from deepspeed.ops.op_builder import SparseAttnBuilder
 
 if not deepspeed.ops.__compatible_ops__[SparseAttnBuilder.NAME]:
-    pytest.skip("sparse attention op is not compatible on this system",
-                allow_module_level=True)
+    pytestmark = pytest.mark.skip(
+        reason="sparse attention op is not compatible on this system")
 
 
 def dense_to_sparse(w, mask, block):
@@ -89,10 +89,14 @@ def run_softmax_sparse(x, scale, dx, kp_mask, attn_mask, layout, block):
 
 
 def init_softmax_inputs(Z, H, M, N, scale, rho, block, dtype, dense_x=True, layout=None):
+    if bool(pytest.use_hpu) == True:
+        device='hpu'
+    else:
+        device='cuda'
     if layout is None:
         layout = make_layout(rho, (H, M // block, N // block))
     if dense_x:
-        x = torch.rand((Z, H, M, N), dtype=dtype, requires_grad=True, device='cuda')
+        x = torch.rand((Z, H, M, N), dtype=dtype, requires_grad=True, device=device)
     else:
         x = torch.rand((Z,
                         layout.sum(),
@@ -100,7 +104,7 @@ def init_softmax_inputs(Z, H, M, N, scale, rho, block, dtype, dense_x=True, layo
                         block),
                        dtype=dtype,
                        requires_grad=True,
-                       device='cuda')
+                       device=device)
     dx = torch.rand_like(x)
     bool_attn_mask = torch.randint(low=0,
                                    high=2,
@@ -108,7 +112,7 @@ def init_softmax_inputs(Z, H, M, N, scale, rho, block, dtype, dense_x=True, layo
                                          N),
                                    dtype=torch.bool,
                                    requires_grad=False,
-                                   device='cuda')
+                                   device=device)
     fp_attn_mask = bool_attn_mask.type(dtype)
     kp_mask = torch.randint(low=0,
                             high=2,
@@ -116,7 +120,7 @@ def init_softmax_inputs(Z, H, M, N, scale, rho, block, dtype, dense_x=True, layo
                                   N),
                             dtype=dtype,
                             requires_grad=False,
-                            device='cuda')
+                            device=device)
     kp_mask[kp_mask == 1.] = float('-inf')
     return layout, x, dx, bool_attn_mask, fp_attn_mask, kp_mask
 
@@ -136,7 +140,13 @@ def _skip_on_cuda_compatability():
 @pytest.mark.parametrize("width", [256, 576])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_softmax(block, width, dtype):
-    _skip_on_cuda_compatability()
+    if bool(pytest.use_hpu) == True:
+        import habana_frameworks.torch.core as htcore
+        if os.getenv("REPLACE_FP16", default=None):
+            if dtype == torch.float16:
+                dtype = torch.bfloat16
+    else:
+        _skip_on_cuda_compatability()
     Z = 2
     H = 4
     scale = 0.4
@@ -188,14 +198,18 @@ def run_matmul_sparse(x, w, mode, trans_a, trans_b, layout, block, dy):
 
 def init_matmul_inputs(Z, H, M, N, K, rho, mode, trans_a, trans_b, block, dtype, layout):
     torch.manual_seed(1)
+    if bool(pytest.use_hpu) == True:
+        device='hpu'
+    else:
+        device='cuda'
     AS0 = K if trans_a else M
     AS1 = M if trans_a else K
     BS0 = N if trans_b else K
     BS1 = K if trans_b else N
     shape = {'sdd': (M, N), 'dsd': (AS0, AS1), 'dds': (BS0, BS1)}[mode]
-    x = torch.rand((Z, H, AS0, AS1), dtype=dtype, requires_grad=True, device='cuda')
-    w = torch.rand((Z, H, BS0, BS1), dtype=dtype, requires_grad=True, device='cuda')
-    dy = torch.rand((Z, H, M, N), dtype=dtype, device='cuda')
+    x = torch.rand((Z, H, AS0, AS1), dtype=dtype, requires_grad=True, device=device)
+    w = torch.rand((Z, H, BS0, BS1), dtype=dtype, requires_grad=True, device=device)
+    dy = torch.rand((Z, H, M, N), dtype=dtype, device=device)
     if layout is None:
         layout = make_layout(rho, (H, shape[0] // block, shape[1] // block))
     else:
@@ -231,7 +245,13 @@ testdata = [
 
 @pytest.mark.parametrize("block, dtype, mode, trans_a, trans_b", testdata)
 def test_matmul(block, dtype, mode, trans_a, trans_b):
-    _skip_on_cuda_compatability()
+    if bool(pytest.use_hpu) == True:
+        import habana_frameworks.torch.core as htcore
+        if os.getenv("REPLACE_FP16", default=None):
+            if dtype == torch.float16:
+                dtype = torch.bfloat16
+    else:
+        _skip_on_cuda_compatability()
     Z = 3
     H = 2
     M = 128

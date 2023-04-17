@@ -3,6 +3,11 @@ import torch
 from deepspeed.runtime.zero.linear import LinearModuleForZeroStage3
 
 
+pytestmark = pytest.mark.skipif(
+    bool(pytest.use_hpu) == True,
+    reason="AMP autocast and half_op is no supported by HPU.")
+
+
 @pytest.mark.parametrize('half_op', [False, True])
 def test_missing_amp_autocast(tmpdir, half_op):
     hidden_dim = 4

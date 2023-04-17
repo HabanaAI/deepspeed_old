@@ -3,6 +3,14 @@ import deepspeed
 import numpy as np
 from unit.common import DistributedTest
 from unit.simple_model import SimpleModel
+from unit.hpu import *
+
+pytestmark = pytest.mark.skipif(
+    ((bool(pytest.use_hpu) == True) and (get_hpu_dev_version() == "Gaudi")),
+    reason="FP16 datatype is not supported by Gaudi.")
+pytestmark = pytest.mark.skipif(
+    ((bool(pytest.use_hpu) == True) and (get_hpu_dev_version() == "Gaudi2")),
+    reason="FP16 datatype support is not added for Gaudi2. SW-111219")
 
 
 def run_model_step(model, gradient_list):
@@ -33,6 +41,11 @@ class TestFused(DistributedTest):
                 "loss_scale_window": 2
             }
         }
+        if bool(pytest.use_hpu) == True:
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
+
         hidden_dim = 1
         model = SimpleModel(hidden_dim)
         model, optim, _, _ = deepspeed.initialize(config=config_dict,
@@ -70,6 +83,10 @@ class TestFused(DistributedTest):
                 "loss_scale_window": 2
             }
         }
+        if bool(pytest.use_hpu) == True:
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
         hidden_dim = 1
         model = SimpleModel(hidden_dim)
         model, optim, _, _ = deepspeed.initialize(config=config_dict,
@@ -105,6 +122,10 @@ class TestFused(DistributedTest):
                 "loss_scale_window": 2
             }
         }
+        if bool(pytest.use_hpu) == True:
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
         hidden_dim = 1
         model = SimpleModel(hidden_dim)
         model, optim, _, _ = deepspeed.initialize(config=config_dict,
@@ -164,6 +185,10 @@ class TestUnfused(DistributedTest):
                 "loss_scale_window": 2
             }
         }
+        if bool(pytest.use_hpu) == True:
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
         hidden_dim = 1
         model = SimpleModel(hidden_dim)
         model, optim, _, _ = deepspeed.initialize(config=config_dict,
@@ -201,6 +226,10 @@ class TestUnfused(DistributedTest):
                 "min_loss_scale": 0.25
             }
         }
+        if bool(pytest.use_hpu) == True:
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
         hidden_dim = 1
         model = SimpleModel(hidden_dim)
         model, optim, _, _ = deepspeed.initialize(config=config_dict,
@@ -238,6 +267,10 @@ class TestUnfused(DistributedTest):
                 "loss_scale_window": 2
             }
         }
+        if bool(pytest.use_hpu) == True:
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
         hidden_dim = 1
         model = SimpleModel(hidden_dim)
         model, optim, _, _ = deepspeed.initialize(config=config_dict,

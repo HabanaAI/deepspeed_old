@@ -1,0 +1,41 @@
+testJobConfig:
+  test:
+    devices:
+      gaudi:
+        hwType:
+          sim:
+      gaudi2:
+        hwType:
+          sim:
+  unit_tests_ci:
+    customYamlLocation: .ci/pipelines/tests/unit_tests.yml
+    devices:
+      gaudi:
+        hwType:
+          sim:
+      gaudi2:
+        hwType:
+          asic:
+  unit_tests_promote:
+    customYamlLocation: .ci/pipelines/tests/unit_tests.yml
+    devices:
+      gaudi:
+        hwType:
+          sim:
+      gaudi2:
+        hwType:
+          asic:
+  tests_gpu_ci:
+    customJenkinsFile: .ci/pipelines/tests/gpu.jenkinsfile
+    envVars:
+      TEST_SUITE: ci
+      GPU_COUNT: 1
+    devices:
+      gpu:
+  tests_gpu_promote:
+    customJenkinsFile: .ci/pipelines/tests/gpu.jenkinsfile
+    envVars:
+      TEST_SUITE: promote
+      GPU_COUNT: 1
+    devices:
+      gpu:

@@ -1,0 +1,10 @@
+{
+    "optimizer": {
+      "type": "adam",
+      "params": {
+        "torch_adam": "torch_impl",
+        "adam_w_mode": false
+      }
+    },
+    "train_batch_size": 2
+}

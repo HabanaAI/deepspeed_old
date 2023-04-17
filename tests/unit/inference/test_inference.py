@@ -2,16 +2,19 @@ import os
 import time
 import torch
 import pytest
+import json
 import itertools
 import deepspeed
 from deepspeed.git_version_info import torch_info
 from unit.common import DistributedTest
 from packaging import version as pkg_version
 from deepspeed.ops.op_builder import OpBuilder
-from transformers import pipeline
+from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer
 from transformers.models.t5.modeling_t5 import T5Block
 from transformers.models.roberta.modeling_roberta import RobertaLayer
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, hf_api
+from unit.hpu import *
+
 
 rocm_version = OpBuilder.installed_rocm_version()
 if rocm_version != (0, 0):
@@ -48,7 +51,24 @@ _opt_models = [
     "facebook/opt-125m",        # 125m, 1.7B, ..., 175B variants have the same model architecture.
     "facebook/opt-350m",        # 350m applies layer norm after attnention layer which is different than other variants.
 ]
-_all_models = HfApi().list_models()
+if os.getenv("TRANSFORMERS_OFFLINE", default = None):
+    if os.getenv("HF_HOME", default = None):
+        model_info_f = os.path.join(os.getenv("HF_HOME", default = None), 'model_info.json')
+        with open(model_info_f, 'r') as f:
+            data = json.load(f)
+        _all_models = [hf_api.ModelInfo(**x) for x in data]
+    else:
+        assert 1
+elif os.getenv("STORE_HF", default = None):
+    if os.getenv("HF_HOME", default = None):
+        _all_models = HfApi().list_models()
+        all_models_info = [model_info.__dict__ for model_info in _all_models]
+        json_object = json.dumps(all_models_info, indent = 4)
+        model_info_f = os.path.join(os.getenv("HF_HOME", default = None), 'model_info.json')
+        with open(model_info_f, 'w') as f:
+            f.write(json_object)
+else:
+    _all_models = HfApi().list_models()
 
 test_models = set(_bert_models + _roberta_models + _gpt_models + _opt_models)
 test_tasks = [
@@ -84,8 +104,18 @@ def model_w_task(request):
     return request.param
 
 
-@pytest.fixture(params=[torch.float, torch.half], ids=["fp32", "fp16"])
+dtype_params = [torch.float, torch.half]
+dtype_ids = ["fp32", "fp16"]
+if bool(pytest.use_hpu) == True:
+    dtype_params = [torch.float, torch.bfloat16, torch.half]
+    dtype_ids = ["fp32", "bf16", "fp16"]
+
+@pytest.fixture(params=dtype_params, ids=dtype_ids)
 def dtype(request):
+    if bool(pytest.use_hpu) == True:
+        # FP16 is not supported on Gaudi1.
+        if get_hpu_dev_version() == "Gaudi" and request.param == torch.float16:
+            pytest.skip("FP16 is not supported by Gaudi1.")
     return request.param
 
 
@@ -107,12 +137,12 @@ def invalid_model_task_config(model_w_task, dtype, enable_cuda_graph):
         msg = "DS inference injection doesn't work well on older torch versions"
     elif model not in pytest.all_models[task]:
         msg = f"Not a valid model / task combination: {model} / {task}"
-    elif enable_cuda_graph and (torch_info["cuda_version"] == "0.0"):
+    elif (not bool(pytest.use_hpu) == True) and enable_cuda_graph and (torch_info["cuda_version"] == "0.0"):
         msg = "CUDA not detected, cannot use CUDA Graph"
-    elif enable_cuda_graph and pkg_version.parse(
+    elif (not bool(pytest.use_hpu) == True) and enable_cuda_graph and pkg_version.parse(
             torch.__version__) < pkg_version.parse("1.10"):
         msg = "CUDA Graph is only available in torch versions >= 1.10"
-    elif "gpt-j-6B" in model:
+    elif "gpt-j-6B" in model and (not bool(pytest.use_hpu) == True):
         if dtype != torch.half:
             msg = f"Not enough GPU memory to run {model} with dtype {dtype}"
         elif enable_cuda_graph:
@@ -238,41 +268,75 @@ class TestModelTask(DistributedTest):
 
         model, task = model_w_task
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
+        if bool(pytest.use_hpu) == True:
+            import argparse
+            import deepspeed.module_inject as module_inject
+            import habana_frameworks.torch as htorch
+            device = torch.device(f"hpu:{local_rank}")
+        else:
+            device = torch.device(f"cuda:{local_rank}")
 
         # Load the model on CPU first to avoid OOM for large models @fp32
-        pipe = pipeline(task, model=model, device=-1, framework="pt")
+        if dtype == torch.bfloat16:
+            pipe = pipeline(task, model=model, device=-1,
+                            framework="pt", torch_dtype=torch.bfloat16)
+        else:
+            pipe = pipeline(task, model=model,
+                            device=-1, framework="pt")
         if dtype == torch.half:
             pipe.model.half()
 
-        # Switch device to GPU after converting to half
-        device = torch.device(f"cuda:{local_rank}")
+        # Switch device to GPU/HPU after converting to half
         pipe.device = device
         pipe.model.to(device)
 
         # Warm-up queries for perf measurement
         #for i in range(10):
         #    _ = pipe(query, **inf_kwargs)
-        torch.cuda.synchronize()
+        if bool(pytest.use_hpu) == True:
+            htorch.hpu.synchronize()
+        else:
+            torch.cuda.synchronize()
         start = time.time()
         bs_output = pipe(query, **inf_kwargs)
-        torch.cuda.synchronize()
+        if bool(pytest.use_hpu) == True:
+            htorch.hpu.synchronize()
+        else:
+            torch.cuda.synchronize()
         bs_time = time.time() - start
-
-        pipe.model = deepspeed.init_inference(
-            pipe.model,
-            mp_size=1,
-            dtype=dtype,
-            replace_method="auto",
-            replace_with_kernel_inject=True,
-            enable_cuda_graph=enable_cuda_graph,
-        )
+        if bool(pytest.use_hpu) == True:
+            pipe.model = deepspeed.init_inference(
+                pipe.model,
+                mp_size=1,
+                dtype=dtype,
+                replace_method="auto",
+                replace_with_kernel_inject=False,
+                enable_cuda_graph=enable_cuda_graph,
+                injection_policy={
+                    "BertLayer": (module_inject.HFBertLayerPolicy,)},
+            )
+        else:
+            pipe.model = deepspeed.init_inference(
+                 pipe.model,
+                 mp_size=1,
+                 dtype=dtype,
+                 replace_method="auto",
+                 replace_with_kernel_inject=True,
+                 enable_cuda_graph=enable_cuda_graph,
+             )
         # Warm-up queries for perf measurement
         #for i in range(10):
         #    _ = pipe(query, **inf_kwargs)
-        torch.cuda.synchronize()
+        if bool(pytest.use_hpu) == True:
+            htorch.hpu.synchronize()
+        else:
+            torch.cuda.synchronize()
         start = time.time()
         ds_output = pipe(query, **inf_kwargs)
-        torch.cuda.synchronize()
+        if bool(pytest.use_hpu) == True:
+            htorch.hpu.synchronize()
+        else:
+            torch.cuda.synchronize()
         ds_time = time.time() - start
 
         # facebook/opt* and some bigscient/bloom* models are not matching
@@ -322,14 +386,26 @@ class TestMPSize(DistributedTest):
         # enough GPU memory
         pipe = pipeline(task, model=model, device=-1, framework="pt")
         bs_output = pipe(query, **inf_kwargs)
-
-        pipe.model = deepspeed.init_inference(pipe.model,
+        if bool(pytest.use_hpu) == True:
+            import deepspeed.module_inject as module_inject
+            pipe.model = deepspeed.init_inference(
+                pipe.model,
+                mp_size=self.world_size,
+                dtype=dtype,
+                replace_method="auto",
+                replace_with_kernel_inject=False,
+                injection_policy={
+                    "BertLayer": (module_inject.HFBertLayerPolicy,)},
+            )
+            pipe.device = torch.device(f"hpu:{local_rank}")
+        else:
+            pipe.model = deepspeed.init_inference(pipe.model,
                                               mp_size=self.world_size,
                                               dtype=dtype,
                                               replace_method="auto",
                                               replace_with_kernel_inject=True)
-        # Switch device to GPU so that input tensors are not on CPU
-        pipe.device = torch.device(f"cuda:{local_rank}")
+            # Switch device to GPU so that input tensors are not on CPU
+            pipe.device = torch.device(f"cuda:{local_rank}")
         ds_output = pipe(query, **inf_kwargs)
 
         print(local_rank, "baseline", bs_output)
@@ -384,13 +460,21 @@ class TestInjectionPolicy(DistributedTest):
         # enough GPU memory
         pipe = pipeline(task, model=model, device=-1, framework="pt")
         bs_output = pipe(query, **inf_kwargs)
-
-        pipe.model = deepspeed.init_inference(pipe.model,
+        if bool(pytest.use_hpu) == True:
+            pipe.model = deepspeed.init_inference(
+                pipe.model,
+                mp_size=world_size,
+                dtype=dtype,
+                injection_policy=injection_policy
+            )
+            pipe.device = torch.device(f"hpu:{local_rank}")
+        else:
+            pipe.model = deepspeed.init_inference(pipe.model,
                                               mp_size=world_size,
                                               dtype=dtype,
                                               injection_policy=injection_policy)
-        # Switch device to GPU so that input tensors are not on CPU
-        pipe.device = torch.device(f"cuda:{local_rank}")
+            # Switch device to GPU so that input tensors are not on CPU
+            pipe.device = torch.device(f"cuda:{local_rank}")
         ds_output = pipe(query, **inf_kwargs)
 
         print(local_rank, "baseline", bs_output)
@@ -422,11 +506,17 @@ class TestLMCorrectness(DistributedTest):
         import lm_eval.evaluator
 
         local_rank = os.getenv("LOCAL_RANK", "0")
-        device = torch.device(f"cuda:{local_rank}")
+        if bool(pytest.use_hpu) == True:
+            import deepspeed.module_inject as module_inject
+            import habana_frameworks.torch as htorch
+            dev_name = f"hpu:{local_rank}"
+            device = torch.device(f"hpu:{local_rank}")
+        else:
+            dev_name = f"cuda:{local_rank}"
+            device = torch.device(f"cuda:{local_rank}")
         dtype = torch.float
         task_dict = lm_eval.tasks.get_task_dict([task])
-
-        if 'gpt-j-6B' in model_name:
+        if 'gpt-j-6B' in model_name and not bool(pytest.use_hpu) == True:
             dtype = torch.half
             lm = lm_eval.models.get_model(model_family).create_from_arg_string(
                 f"pretrained={model_name}",
@@ -436,28 +526,54 @@ class TestLMCorrectness(DistributedTest):
         else:
             lm = lm_eval.models.get_model(model_family).create_from_arg_string(
                 f"pretrained={model_name}",
-                {"device": "cuda"})
+                {"device": dev_name})
 
-        torch.cuda.synchronize()
+        if bool(pytest.use_hpu) == True:
+            htorch.hpu.synchronize()
+        else:
+            torch.cuda.synchronize()
         start = time.time()
         bs_output = lm_eval.evaluator.evaluate(lm=lm, task_dict=task_dict)
-        torch.cuda.synchronize()
-        bs_time = time.time() - start
 
-        ds_model = deepspeed.init_inference(
-            getattr(lm,
-                    model_family),
-            mp_size=1,
-            dtype=dtype,
-            replace_method="auto",
-            replace_with_kernel_inject=True,
-            enable_cuda_graph=False,
-        )
+        if bool(pytest.use_hpu) == True:
+            htorch.hpu.synchronize()
+        else:
+            torch.cuda.synchronize()
+        bs_time = time.time() - start
+        if bool(pytest.use_hpu) == True:
+
+            ds_model = deepspeed.init_inference(
+                getattr(lm,
+                        model_family),
+                mp_size=1,
+                dtype=dtype,
+                replace_method="auto",
+                replace_with_kernel_inject=False,
+                enable_cuda_graph=False,
+                injection_policy={
+                    "BertLayer": (module_inject.HFBertLayerPolicy,)},
+            )
+        else:
+            ds_model = deepspeed.init_inference(
+                getattr(lm,
+                        model_family),
+                mp_size=1,
+                dtype=dtype,
+                replace_method="auto",
+                replace_with_kernel_inject=True,
+                enable_cuda_graph=False,
+            )
         setattr(lm, model_family, ds_model)
-        torch.cuda.synchronize()
+        if bool(pytest.use_hpu) == True:
+            htorch.hpu.synchronize()
+        else:
+            torch.cuda.synchronize()
         start = time.time()
         ds_output = lm_eval.evaluator.evaluate(lm=lm, task_dict=task_dict)
-        torch.cuda.synchronize()
+        if bool(pytest.use_hpu) == True:
+            htorch.hpu.synchronize()
+        else:
+            torch.cuda.synchronize()
         ds_time = time.time() - start
 
         ppl_diff = abs(bs_output["results"][task]["ppl"] -

@@ -1,3 +1,4 @@
+import pytest
 from deepspeed.checkpoint import model_3d_desc
 
 

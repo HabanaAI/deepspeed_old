@@ -128,7 +128,8 @@ class PipelineModule(nn.Module):
                  partition_method='parameters',
                  activation_checkpoint_interval=0,
                  activation_checkpoint_func=checkpointing.checkpoint,
-                 checkpointable_layers=None):
+                 checkpointable_layers=None,
+                 use_hpu=False):
 
         super().__init__()
 
@@ -200,7 +201,9 @@ class PipelineModule(nn.Module):
 
         #with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
         self._build()
-        self.to(f'cuda:{self.local_rank}')
+
+        self.device = "hpu" if use_hpu else f'cuda:{self.local_rank}'
+        self.to(self.device)
 
         self.tied_comms = self._index_tied_modules()
         self._synchronize_tied_weights()
@@ -616,7 +619,8 @@ class PipelineModule(nn.Module):
             sd_loader = SDLoaderFactory.get_sd_loader(
                 model_ckpt_list,
                 version=2.0,
-                checkpoint_engine=checkpoint_engine)
+                checkpoint_engine=checkpoint_engine,
+                device=self.device)
             load_path, checkpoint, _ = sd_loader.load(mp_world_size, mp_rank, module_key=None, is_pipe_parallel=True)
 
             layer.load_state_dict(checkpoint)

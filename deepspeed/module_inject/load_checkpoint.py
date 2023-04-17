@@ -1,7 +1,7 @@
 from torch import nn
 import deepspeed.ops.transformer as transformer_inference
 from ..runtime.zero import GatheredParameters
-from .layers import LinearLayer, Normalize, EmbeddingLayer, OPTEmbedding
+from .layers import LinearLayer, LinearAllreduce, Normalize, EmbeddingLayer, OPTEmbedding
 import torch
 import gc
 
@@ -14,7 +14,8 @@ def load_model_with_checkpoint(r_module,
                                rank=0,
                                param_names=None,
                                transformer_config=None,
-                               megatron_v2=False):
+                               megatron_v2=False,
+                               device=None):
     error_msgs = []
 
     def transpose(data):
@@ -34,13 +35,12 @@ def load_model_with_checkpoint(r_module,
                                     modifier_rank=0):
                 module._load_from_sd(*args)
         else:
-            if hasattr(module, 'weight'):
-                module.weight = mp_replace.copy(module.weight.data,
+            if hasattr(module, 'weight') and prefix + 'weight' in sd[0].keys():
+                #TODO:[SW-111299] why need to pass weight and not weight.data
+                module.weight = mp_replace.copy(module.weight,
                                                 sd[0][prefix + 'weight'])
             if prefix + 'bias' in sd[0].keys():
-                module.bias = mp_replace.copy(module.bias.data, sd[0][prefix + 'bias'])
-        args = None
-        gc.collect()
+                module.bias = mp_replace.copy(module.bias, sd[0][prefix + 'bias'])
 
     def load_transformer_layer(module, prefix):
         if ckpt_type == "tp":
@@ -289,6 +289,7 @@ def load_model_with_checkpoint(r_module,
         EmbeddingLayer: load,
         LinearLayer: load,
         Normalize: load,
+        LinearAllreduce: load,
         transformer_inference.DeepSpeedTransformerInference: load_transformer_layer,
         OPTLearnedPositionalEmbedding: load,
         OPTEmbedding: load
@@ -296,7 +297,7 @@ def load_model_with_checkpoint(r_module,
 
     all_ds_ids = {}
 
-    def load_module_recursive(module, prefix='', level=0):
+    def load_module_recursive(module, prefix='', level=0, device=None):
         for name, child in module.named_children():
             if child.__class__ in layer_policies:
                 checking_key = prefix + name + '.'
@@ -306,7 +307,7 @@ def load_model_with_checkpoint(r_module,
                         child.weight.ds_id in all_ds_ids):
                         prefix1 = all_ds_ids[child.weight.ds_id]
                         if child.__class__ is nn.Linear:
-                            child = LinearLayer(weight=all_ds_ids[child.weight.ds_id])
+                            child = LinearLayer(weight=all_ds_ids[child.weight.ds_id],device=device)
                             setattr(module, name, child)
                     continue
                 child_params = list(child.parameters())
@@ -319,34 +320,36 @@ def load_model_with_checkpoint(r_module,
                     if child.__class__ is nn.LayerNorm:
                         child = Normalize(dim=ds_shape[-1],
                                           dtype=child.weight.dtype,
-                                          eps=child.eps)
+                                          eps=child.eps,
+                                          device=device)
                         setattr(module, name, child)
                     elif child.__class__ is nn.Linear:
                         child = LinearLayer(weight_shape=child.weight.shape,
-                                            bias=child.bias)
+                                            bias=child.bias, device=device)
                         setattr(module, name, child)
                     elif child.__class__ is OPTLearnedPositionalEmbedding:
-                        child = OPTEmbedding(weight_shape=ds_shape)
+                        child = OPTEmbedding(weight_shape=ds_shape, device=device)
                         setattr(module, name, child)
                     else:
                         ds_id = None
                         if hasattr(child.weight, 'ds_id'):
                             ds_id = child.weight.ds_id
                         child = EmbeddingLayer(weight_shape=ds_shape,
-                                               dtype=child.weight.dtype)
+                                               dtype=child.weight.dtype,
+                                               device=device)
                         if ds_id is not None:
                             all_ds_ids[ds_id] = child.weight
                         setattr(module, name, child)
-
                 layer_policies[child.__class__](child, prefix + name + '.')
             else:
                 load_module_recursive(
                     child,
-                    prefix if (level == 0 and ckpt_type == 'pp') and param_names[-2] else \
+                    prefix if (level == 0 and ckpt_type == 'pp') and (param_names is None or param_names[-2]) else \
                     prefix + name + '.',
-                    level + 1)
+                    level + 1,
+                    device=device)
 
-    load_module_recursive(r_module)
+    load_module_recursive(r_module,device=device)
 
     #XXX: hack to tie embedding w. lm_head for BLOOM, need to revist soon
     embedding_weight = None

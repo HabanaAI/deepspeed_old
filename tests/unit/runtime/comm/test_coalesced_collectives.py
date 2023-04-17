@@ -1,6 +1,8 @@
 """unit tests for coalesced collectives"""
 
 import torch
+import os
+import pytest
 import deepspeed.comm as dist
 from deepspeed.runtime.comm.coalesced_collectives import reduce_scatter_coalesced
 
@@ -11,11 +13,19 @@ class TestReduceScatterCoalesced(DistributedTest):
     world_size = 2
 
     def test_single_input(self):
+        dtype=torch.half
+        if bool(pytest.use_hpu) == True:
+            import habana_frameworks.torch.hpu as hpu
+            device = 'hpu:' + str(hpu.current_device())
+            if os.getenv("REPLACE_FP16", default=None):
+                dtype = torch.float
+        else:
+            device = torch.cuda.current_device()
         input = torch.full((6,
                             ),
                            dist.get_rank(),
-                           dtype=torch.half,
-                           device=torch.cuda.current_device())
+                           dtype=dtype,
+                           device=device)
 
         (output, ) = reduce_scatter_coalesced([input], dist.get_world_group())
 
@@ -23,7 +33,15 @@ class TestReduceScatterCoalesced(DistributedTest):
         assert torch.allclose(output, torch.full_like(output, 0.5))
 
     def test_two_inputs(self):
-        tensor_kwargs = {"device": torch.cuda.current_device(), "dtype": torch.half}
+        dtype=torch.half
+        if bool(pytest.use_hpu) == True:
+            import habana_frameworks.torch.hpu as hpu
+            device = 'hpu:' + str(hpu.current_device())
+            if os.getenv("REPLACE_FP16", default=None):
+                dtype = torch.float
+        else:
+            device = torch.cuda.current_device()
+        tensor_kwargs = {"device": device, "dtype": dtype}
         inputs = [
             dist.get_rank() * torch.arange(0,
                                            6,
@@ -51,7 +69,15 @@ class TestReduceScatterCoalescedTensorSmallerThanWorldSize(DistributedTest):
     world_size = 2
 
     def test(self):
-        input = torch.zeros((1, ), dtype=torch.half, device=torch.cuda.current_device())
+        dtype=torch.half
+        if bool(pytest.use_hpu) == True:
+            import habana_frameworks.torch.hpu as hpu
+            device = 'hpu:' + str(hpu.current_device())
+            if os.getenv("REPLACE_FP16", default=None):
+                dtype = torch.float
+        else:
+            device = torch.cuda.current_device()
+        input = torch.zeros((1, ), dtype=dtype, device=device)
 
         (output, ) = reduce_scatter_coalesced([input], dist.get_world_group())
 

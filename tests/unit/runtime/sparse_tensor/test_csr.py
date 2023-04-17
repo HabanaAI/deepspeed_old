@@ -1,4 +1,5 @@
 import torch
+import pytest
 import random
 from deepspeed.runtime.sparse_tensor import SparseTensor
 
