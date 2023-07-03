@@ -515,6 +515,12 @@ def get_zero_allow_untested_optimizer(param_dict):
                             ZERO_ALLOW_UNTESTED_OPTIMIZER_DEFAULT)
 
 
+def get_zero_allow_comm_data_type_fp32(param_dict):
+    return get_scalar_param(param_dict,
+                            ZERO_ALLOW_COMM_DATA_TYPE_FP32,
+                            ZERO_ALLOW_COMM_DATA_TYPE_FP32_DEFAULT)
+
+
 def get_scheduler_name(param_dict):
     if SCHEDULER in param_dict.keys() and TYPE in param_dict[SCHEDULER].keys():
         return param_dict[SCHEDULER][TYPE]
@@ -870,6 +876,8 @@ class DeepSpeedConfig(object):
         self.optimizer_legacy_fusion = get_optimizer_legacy_fusion(param_dict)
 
         self.zero_allow_untested_optimizer = get_zero_allow_untested_optimizer(
+            param_dict)
+        self.zero_allow_comm_data_type_fp32 = get_zero_allow_comm_data_type_fp32(
             param_dict)
 
         self.scheduler_name = get_scheduler_name(param_dict)

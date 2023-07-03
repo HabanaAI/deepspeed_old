@@ -32,10 +32,13 @@ class FP16_UnfusedOptimizer(DeepSpeedOptimizer):
                  verbose=True,
                  mpu=None,
                  clip_grad=0.0,
-                 fused_lamb_legacy=False):
+                 fused_lamb_legacy=False,
+                 use_hpu=False):
 
         self.fused_lamb_legacy = fused_lamb_legacy
         self._global_grad_norm = 0.
+
+        self.use_hpu = use_hpu
 
         if dist.get_rank() == 0:
             logger.info(f'Fused Lamb Legacy : {self.fused_lamb_legacy} ')
@@ -428,17 +431,22 @@ class FP16_UnfusedOptimizer(DeepSpeedOptimizer):
         return repr(self.optimizer)
 
     def initialize_optimizer_states(self):
+        if self.use_hpu:
+            device = torch.device("hpu")
+        else:
+            device = torch.cuda.current_device()
+
         for i, group in enumerate(self.fp16_groups):
             for param in group:
                 param.grad = torch.zeros(param.size(),
                                          dtype=param.dtype,
-                                         device=torch.cuda.current_device())
+                                         device=device)
 
         for i, group in enumerate(self.fp32_groups):
             for param in group:
                 param.grad = torch.zeros(param.size(),
                                          dtype=param.dtype,
-                                         device=torch.cuda.current_device())
+                                         device=device)
 
         self.optimizer.step()
 

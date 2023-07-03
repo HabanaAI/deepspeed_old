@@ -6,6 +6,7 @@ import deepspeed
 import deepspeed.comm as dist
 import deepspeed.runtime.utils as ds_utils
 from deepspeed.runtime.pipe.module import PipelineModule, LayerSpec
+import os
 
 
 class AlexNet(nn.Module):
@@ -108,13 +109,26 @@ def cifar_trainset(fp16=False):
 
     transform = transforms.Compose(transform_list)
 
-    local_rank = torch.cuda.current_device()
+    local_rank = int(os.getenv('LOCAL_RANK', '0'))
 
     # Only one rank per machine downloads.
     dist.barrier()
     if local_rank != 0:
         dist.barrier()
-    trainset = torchvision.datasets.CIFAR10(root='/blob/cifar10-data',
+    if os.getenv("CIFAR10_OFFLINE", default = None):
+        if os.getenv("CIFAR10_DATASET_PATH", default = None):
+            trainset = torchvision.datasets.CIFAR10(root=os.getenv("CIFAR10_DATASET_PATH", default = None),
+                                            train=True,
+                                            download=False,
+                                            transform=transform)
+    elif os.getenv("STORE_CIFAR10", default = None):
+        if os.getenv("CIFAR10_DATASET_PATH", default = None):
+            trainset = torchvision.datasets.CIFAR10(root=os.getenv("CIFAR10_DATASET_PATH", default = None),
+                                            train=True,
+                                            download=True,
+                                            transform=transform)
+    else:
+        trainset = torchvision.datasets.CIFAR10(root='.',
                                             train=True,
                                             download=True,
                                             transform=transform)
@@ -129,7 +143,15 @@ def train_cifar(model,
                 average_dp_losses=True,
                 fp16=True,
                 seed=123):
-    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+    if bool(pytest.use_hpu) == True:
+        import habana_frameworks.torch.hpu as hpu
+        device = 'hpu:' + str(hpu.current_device())
+        #TODO SW-123528: enable once we added support in HPU
+        fork_rng = False
+    else:
+        device = torch.cuda.current_device()
+        fork_rng = True
+    with torch.random.fork_rng(enabled=fork_rng):
         ds_utils.set_random_seed(seed)
 
         # disable dropout
@@ -152,7 +174,7 @@ def train_cifar(model,
                 print(f'STEP={step} LOSS={loss.item()}')
 
         if average_dp_losses:
-            loss_tensor = torch.tensor(losses).cuda()
+            loss_tensor = torch.tensor(losses).to(device)
             dist.all_reduce(loss_tensor)
             loss_tensor /= dist.get_world_size()
             losses = loss_tensor.tolist()

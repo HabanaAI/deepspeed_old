@@ -1,6 +1,8 @@
+import pytest
 import torch
 import deepspeed
 from unit.common import DistributedTest
+from unit.hpu import *
 
 
 class Model(torch.nn.Module):
@@ -52,6 +54,10 @@ class TestSparseAdam(DistributedTest):
             "steps_per_print": 1,
             "sparse_gradients": True
         }
+        if bool(pytest.use_hpu) == True:
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
         model, optimizer = get_model_optimizer()
         loss = torch.nn.BCEWithLogitsLoss()
         engine, _, _, _ = deepspeed.initialize(model=model,

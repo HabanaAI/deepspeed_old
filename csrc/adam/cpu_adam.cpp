@@ -1,5 +1,4 @@
 #include "cpu_adam.h"
-#include <cuda_runtime_api.h>
 #include <math.h>
 #include <omp.h>
 #include <torch/extension.h>
@@ -7,11 +6,13 @@
 #include <memory>
 #include <type_traits>
 #include <unordered_map>
-#include "cublas_v2.h"
-#include "cuda.h"
-#include "curand.h"
-#include "custom_cuda_layers.h"
-
+#if not defined (USE_HPU)
+    #include <cuda_runtime_api.h>
+    #include "cublas_v2.h"
+    #include "cuda.h"
+    #include "curand.h"
+    #include "custom_cuda_layers.h"
+#endif
 static std::unordered_map<int, std::shared_ptr<void>> s_optimizers;
 
 // C++ interface
@@ -52,7 +53,9 @@ void Adam_Optimizer::Step_1(float* _params,
             size_t copy_size = TILE;
             if ((t + TILE) > _param_size) copy_size = _param_size - t;
             size_t offset = copy_size + t;
+#if not defined (USE_HPU)
             if ((t / TILE) >= 2) { cudaStreamSynchronize(_streams[_buf_index]); }
+#endif
 
 #pragma omp parallel for
             for (size_t k = t; k < offset; k++) {
@@ -73,7 +76,10 @@ void Adam_Optimizer::Step_1(float* _params,
                 grad = momentum / grad;
                 if (_weight_decay > 0 && _adamw_mode) { param += w_decay * param; }
                 param = grad * step_size + param;
+// _doubled_buffer needed to update params only in case of float16, which is currently not supported on HPU
+#if not defined(USE_HPU)
                 if (dev_params) _doubled_buffer[_buf_index][k - t] = param;
+#endif
 
                 if (half_precision)
                     params_cast_h[k] = (__half)param;
@@ -83,8 +89,11 @@ void Adam_Optimizer::Step_1(float* _params,
                 _exp_avg_sq[k] = variance;
             }
             if (dev_params) {
+// Params are updated only in case of float16, which is currently not supported on HPU
+#if not defined(USE_HPU)
                 launch_param_update(
                     _doubled_buffer[_buf_index], dev_params + t, (copy_size), _streams[_buf_index]);
+#endif
 
                 _buf_index = !_buf_index;
             }
@@ -220,15 +229,20 @@ int ds_adam_step(int optimizer_id,
     opt->IncrementStep(step, beta1, beta2);
     opt->update_state(lr, epsilon, weight_decay, bias_correction);
 
+    bool bit16_precision = false;
+    if ((params.options().dtype() == at::kHalf) ||
+        (params.options().dtype() == at::kBFloat16))
+        bit16_precision = true;
     opt->Step_8(params_ptr,
                 grads_ptr,
                 exp_avg_ptr,
                 exp_avg_sq_ptr,
                 params_c.size(0),
                 nullptr,
-                (params.options().dtype() == at::kHalf));
-
+                bit16_precision);
+#if not defined (USE_HPU)
     opt->SynchronizeStreams();
+#endif
     return 0;
 }
 
@@ -270,7 +284,9 @@ int ds_adam_step_plus_copy(int optimizer_id,
                 gpu_params_ptr,
                 (params.options().dtype() == at::kHalf));
 
+#if not defined (USE_HPU)
     opt->SynchronizeStreams();
+#endif
     return 0;
 }
 

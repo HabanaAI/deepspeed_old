@@ -65,12 +65,14 @@ class TestPipeModuleSequential(DistributedTest):
         base_output = base_output
         base_params = sum(p.numel() for p in base_model.parameters())
 
+        device = 'cuda'
+        if bool(pytest.use_hpu) == True:
+            device = 'hpu'
         pipe_model = copy.deepcopy(sequential_model)
-        pipe_model = PipelineModule(layers=pipe_model, num_stages=2)
-
+        pipe_model = PipelineModule(layers=pipe_model, num_stages=2, use_hpu=(bool(pytest.use_hpu) == True))
         # Ensure all parameters are accounted for.
         my_params = sum(p.numel() for p in pipe_model.parameters())
-        total_pipe_params = torch.LongTensor([my_params]).to('cuda')
+        total_pipe_params = torch.LongTensor([my_params]).to(device)
         dist.all_reduce(total_pipe_params)
         total_pipe_params = total_pipe_params.item()
         assert total_pipe_params == base_params
@@ -81,7 +83,7 @@ class TestPipeModuleSequential(DistributedTest):
             model_parameters=[p for p in pipe_model.parameters()])
 
         if pipe_model.is_first_stage or pipe_model.is_last_stage:
-            pipe_input = base_input.clone().detach().to('cuda')
+            pipe_input = base_input.clone().detach().to(device)
             # label 0 is meaningless
             dataset = [(pipe_input, 0)]
             loader = RepeatingLoader(dataset)

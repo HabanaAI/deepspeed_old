@@ -48,6 +48,7 @@ class ReduceOp(Enum):
 from deepspeed.utils.comms_logging import CommsLogger
 from deepspeed.utils import timer, get_caller_func
 from deepspeed.comm.torch import TorchBackend
+from deepspeed.runtime.utils import get_use_hpu
 
 from deepspeed import utils
 from datetime import timedelta
@@ -55,6 +56,7 @@ from datetime import timedelta
 # Current deepspeed.comm backend (cdb) global object for simple access by client code
 use_ds_backend = False
 cdb = None
+use_stable_all_reduce = False
 
 # Create global timer for ops
 timers = timer.SynchronizedWallClockTimer()
@@ -105,6 +107,9 @@ def configure(
 
     if debug is not None:
         comms_logger.debug = debug
+
+    global use_stable_all_reduce
+    use_stable_all_reduce = str.lower(os.getenv('DEEPSPEED_STABLE_ALL_REDUCE', 'false')) in ['true', '1']
 
 
 # Logging wrapper for timing ops
@@ -223,11 +228,13 @@ def set_backend(backend):
 def broadcast(tensor,
               src,
               group=None,
-              async_op=False,
+              async_op=None,
               prof=False,
               log_name='broadcast',
               debug=get_caller_func()):
     global cdb
+    if async_op is None:
+        async_op = get_use_hpu()
     return cdb.broadcast(tensor=tensor, src=src, group=group, async_op=async_op)
 
 
@@ -235,11 +242,13 @@ def broadcast(tensor,
 def all_gather(tensor_list,
                tensor,
                group=None,
-               async_op=False,
+               async_op=None,
                prof=False,
                log_name='all_gather',
                debug=get_caller_func()):
     global cdb
+    if async_op is None:
+        async_op = get_use_hpu()
     return cdb.all_gather(tensor_list=tensor_list,
                           tensor=tensor,
                           group=group,
@@ -257,12 +266,14 @@ def reduce_scatter_fn(output_tensor,
                       tensor,
                       op=ReduceOp.SUM,
                       group=None,
-                      async_op=False,
+                      async_op=None,
                       prof=False,
                       debug=get_caller_func()):
     global cdb
     global has_warned_reduce_scatter
     assert cdb is not None and cdb.is_initialized(), 'DeepSpeed backend not set, please initialize it using init_process_group()'
+    if async_op is None:
+        async_op = get_use_hpu()
     if cdb.has_reduce_scatter_base:
         return reduce_scatter_base(output_tensor,
                                    tensor,
@@ -275,7 +286,7 @@ def reduce_scatter_fn(output_tensor,
         if not has_warned_reduce_scatter:
             utils.logger.warning(
                 "unable to find torch.distributed._reduce_scatter_base. will fall back to "
-                "torch.distributed.all_gather which will result in suboptimal performance. "
+                "torch.distributed.reduce_scatter which will result in suboptimal performance. "
                 "please consider upgrading your pytorch installation.")
             has_warned_reduce_scatter = True
         input_tensor_lst = list(torch.chunk(tensor, cdb.get_world_size(group)))
@@ -293,11 +304,13 @@ def reduce_scatter_base(output_tensor,
                         tensor,
                         op=ReduceOp.SUM,
                         group=None,
-                        async_op=False,
+                        async_op=None,
                         prof=False,
                         log_name='reduce_scatter_base',
                         debug=get_caller_func()):
     global cdb
+    if async_op is None:
+        async_op = get_use_hpu()
     return cdb.reduce_scatter_base(output_tensor=output_tensor,
                                    input_tensor=tensor,
                                    op=op,
@@ -309,11 +322,13 @@ def reduce_scatter_base(output_tensor,
 def all_gather_base(output_tensor,
                     tensor,
                     group=None,
-                    async_op=False,
+                    async_op=None,
                     prof=False,
                     log_name='all_gather_base',
                     debug=get_caller_func()):
     global cdb
+    if async_op is None:
+        async_op = get_use_hpu()
     return cdb.all_gather_base(output_tensor=output_tensor,
                                input_tensor=tensor,
                                group=group,
@@ -330,11 +345,13 @@ def has_allgather_base():
 def allgather_fn(output_tensor,
                  input_tensor,
                  group=None,
-                 async_op=False,
+                 async_op=None,
                  debug=get_caller_func()):
     global cdb
     global has_warned_all_gather
     assert cdb is not None and cdb.is_initialized(), 'DeepSpeed backend not set, please initialize it using init_process_group()'
+    if async_op is None:
+        async_op = get_use_hpu()
     if cdb.has_allgather_base:
         return all_gather_base(output_tensor,
                                input_tensor,
@@ -362,11 +379,13 @@ def all_to_all_single(output,
                       output_split_sizes=None,
                       input_split_sizes=None,
                       group=None,
-                      async_op=False,
+                      async_op=None,
                       prof=False,
                       log_name='all_to_all_single',
                       debug=get_caller_func()):
     global cdb
+    if async_op is None:
+        async_op = get_use_hpu()
     return cdb.all_to_all_single(output=output,
                                  input=tensor,
                                  output_split_sizes=output_split_sizes,
@@ -408,7 +427,7 @@ def isend(tensor,
           log_name='isend',
           debug=get_caller_func()):
     global cdb
-    return cdb.send(tensor=tensor, dst=dst, group=group, tag=tag)
+    return cdb.isend(tensor=tensor, dst=dst, group=group, tag=tag)
 
 
 @timed_op
@@ -420,7 +439,7 @@ def irecv(tensor,
           log_name='irecv',
           debug=get_caller_func()):
     global cdb
-    return cdb.recv(tensor=tensor, src=src, group=group, tag=tag)
+    return cdb.irecv(tensor=tensor, src=src, group=group, tag=tag)
 
 
 @timed_op
@@ -428,11 +447,13 @@ def gather(tensor,
            gather_list=None,
            dst=0,
            group=None,
-           async_op=False,
+           async_op=None,
            prof=False,
            log_name='gather',
            debug=get_caller_func()):
     global cdb
+    if async_op is None:
+        async_op = get_use_hpu()
     return cdb.gather(tensor=tensor,
                       gather_list=gather_list,
                       dst=dst,
@@ -445,11 +466,13 @@ def scatter(tensor,
             scatter_list=None,
             src=0,
             group=None,
-            async_op=False,
+            async_op=None,
             prof=False,
             log_name='scatter',
             debug=get_caller_func()):
     global cdb
+    if async_op is None:
+        async_op = get_use_hpu()
     return cdb.scatter(tensor=tensor,
                        scatter_list=scatter_list,
                        src=src,
@@ -492,11 +515,13 @@ def reduce(tensor,
            dst,
            op=ReduceOp.SUM,
            group=None,
-           async_op=False,
+           async_op=None,
            prof=False,
            log_name='reduce',
            debug=get_caller_func()):
     global cdb
+    if async_op is None:
+        async_op = get_use_hpu()
     return cdb.reduce(tensor=tensor, dst=dst, op=op, group=group, async_op=async_op)
 
 
@@ -505,23 +530,101 @@ def reduce_scatter(output,
                    input_list,
                    op=ReduceOp.SUM,
                    group=None,
-                   async_op=False,
+                   async_op=None,
                    prof=False,
                    log_name='reduce_scatter',
                    debug=get_caller_func()):
     global cdb
+    if async_op is None:
+        async_op = get_use_hpu()
     return cdb.reduce_scatter(output=output,
                               input_list=input_list,
                               op=op,
                               group=group,
                               async_op=async_op)
 
+class Work(torch.distributed.Work):
+    def __init__(self, result):
+        super().__init__()
+        self.result = result
+    def is_completed(self):
+        return True
+    def wait(self, timeout):
+        return True
+    def result(self):
+        return self.result
+
+@timed_op
+def all_reduce_stable(tensor, op = ReduceOp.SUM , group = None, async_op = None):
+    # This function is only implemented for hpu since always performs async_op
+    # Unexpected behaviour on non hpu platforms
+    assert get_use_hpu(), "Implemented only for hpu"
+
+    MAX_NUMEL = 2**31 - 1
+    numel = tensor.numel()
+    if numel > MAX_NUMEL:
+        orig_tensor = tensor
+        tensor = tensor.view(-1)
+        all_reduce_stable(tensor.narrow(0, 0, MAX_NUMEL), op=op, group=group, async_op=async_op)
+        all_reduce_stable(tensor.narrow(0, MAX_NUMEL, numel-MAX_NUMEL), op=op, group=group, async_op=async_op)
+        return Work([orig_tensor]) if async_op else None
+
+    global cdb
+    rank = cdb.get_rank(group)
+    num_splits = cdb.get_world_size(group)
+
+    #pad tensor if smaller than world size
+    orig_tensor = tensor
+    if num_splits > tensor.numel():
+        tensor = torch.zeros([num_splits], dtype = tensor.dtype, device = tensor.device)
+        tensor[0:orig_tensor.numel()] = orig_tensor.view(-1)
+
+    #calculate split sizes for the tensor to distribute evenly between ranks
+    split_length = tensor.numel() // num_splits
+    remiander = tensor.numel() % num_splits
+    input_splits = [ split_length + 1 if i < remiander else split_length for i in range(num_splits)]
+    output_splits = [ input_splits[rank] for i in range(num_splits)]
+
+    #scatter
+    temp = torch.empty([num_splits, input_splits[rank]], dtype = tensor.dtype).to(device= tensor.device)
+    cdb.all_to_all_single(temp.view(-1),
+                          tensor.view(-1),
+                          output_split_sizes = output_splits,
+                          input_split_sizes = input_splits,
+                          group = group,
+                          async_op = True)
+
+    #reduce
+    if op == ReduceOp.SUM:
+        temp = temp.sum(dim = -2, dtype = tensor.dtype)
+    elif op == ReduceOp.MAX:
+        temp = temp.max(dim = -2).values
+    elif op == ReduceOp.MIN:
+        temp = temp.min(dim = -2).values
+    elif op == ReduceOp.AVG:
+        temp = temp.mean(dim = -2, dtype = tensor.dtype)
+    else:
+        assert False, f"Unknown reduce op {op}"
+
+    #allgather
+    cdb.all_to_all_single(tensor.view(-1),
+                          temp.expand([num_splits,-1]).reshape(-1),
+                          output_split_sizes = input_splits,
+                          input_split_sizes = output_splits,
+                          group=group,
+                          async_op = True)
+
+    #unpad if necessery
+    if id(orig_tensor) != id(tensor):
+        orig_tensor.view(-1).copy_(tensor[0:orig_tensor.numel()])
+
+    return Work([orig_tensor]) if async_op else None
 
 @timed_op
 def all_reduce(tensor,
                op=ReduceOp.SUM,
                group=None,
-               async_op=False,
+               async_op=None,
                prof=False,
                log_name='all_reduce',
                debug=get_caller_func()):
@@ -531,7 +634,12 @@ def all_reduce(tensor,
     # TensorBoard logging for comm calls.?
     global cdb
     #print(f'op = {op}, cdb= {cdb.name}')
-    return cdb.all_reduce(tensor, op, group, async_op)
+    if async_op is None:
+        async_op = get_use_hpu()
+    if use_stable_all_reduce:
+        return all_reduce_stable(tensor, op, group, async_op)
+    else:
+        return cdb.all_reduce(tensor, op, group, async_op)
 
 
 def get_world_group():
@@ -606,7 +714,7 @@ def init_distributed(dist_backend="nccl",
     ''' Initialize dist backend, potentially performing MPI discovery if needed
 
     Arguments:
-        dist_backend: Optional (str). torch distributed backend, e.g., nccl, mpi, gloo
+        dist_backend: Optional (str). torch distributed backend, e.g., nccl, mpi, gloo, hccl
         auto_mpi_discovery Optional (bool). if distributed environment variables are not set, attempt to discover them from MPI
         distributed_port: Optional (int). torch distributed backend port
         verbose: Optional (bool). verbose logging

@@ -27,7 +27,7 @@ from ..utils import logger
 from ..autotuning import Autotuner
 
 DLTS_HOSTFILE = "/job/hostfile"
-EXPORT_ENVS = ['MLFLOW', 'NCCL', 'PYTHON', 'MV2', 'UCX']
+EXPORT_ENVS = ['MLFLOW', 'NCCL', 'PYTHON', 'MV2', 'UCX', 'DEEPSPEED_USE_HPU', 'PT_HPU_LAZY_ACC_PAR_MODE', 'PT_HPU_ENABLE_REFINE_DYNAMIC_SHAPES', 'PT_HPU_ENABLE_WEIGHT_CPU_PERMUTE']
 EXPORT_ENVS += NEBULA_EXPORT_ENVS
 DEEPSPEED_ENVIRONMENT_NAME = ".deepspeed_env"
 DEEPSPEED_ENVIRONMENT_PATHS = [os.path.expanduser("~"), '.']
@@ -171,7 +171,13 @@ def parse_args(args=None):
                         help="User script to launch, followed by any required "
                         "arguments.")
     parser.add_argument('user_args', nargs=argparse.REMAINDER)
-    return parser.parse_args(args=args)
+
+    args = parser.parse_args(args=args)
+
+    #steal --use_hpu arg from user sciprt
+    args.use_hpu = "--use_hpu" in str(args.user_args)
+
+    return args
 
 
 def fetch_hostfile(hostfile_path):
@@ -377,11 +383,27 @@ def main(args=None):
             raise ValueError("Cannot specify num_nodes/gpus with include/exclude")
 
     multi_node_exec = True
+
+    try:
+        import habana_frameworks.torch.hpu as thpu
+        args.use_hpu = True
+    except ImportError as e:
+        print(f"failed importing habana_frameworks.torch.hpu with ImportError: {e=}")
+        pass
+
+    device_count = 0
     if not resource_pool:
         resource_pool = {}
-        device_count = torch.cuda.device_count()
+        print(args)
+
+        if args.use_hpu:
+            device_count = thpu.device_count()
+        elif torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+        else:
+            device_count = args.num_gpus
         if device_count == 0:
-            raise RuntimeError("Unable to proceed, no GPU resources available")
+            raise RuntimeError("Unable to proceed, no {} resources available".format("HPU" if args.use_hpu else "GPU"))
         resource_pool['localhost'] = device_count
         args.master_addr = "127.0.0.1"
         multi_node_exec = False
@@ -436,6 +458,19 @@ def main(args=None):
 
     if args.elastic_training:
         assert not args.no_local_rank, "--no_local_rank argument is not supported in Elastic training"
+
+    if args.use_hpu:
+        env['DEEPSPEED_USE_HPU'] = "true"
+
+        # TODO: SW-113485 need to remove the below WA once SW-113485 is unblocked
+        def update_wa_env_var(key, value):
+            if key not in os.environ.keys():
+                env[key] = value
+        update_wa_env_var("PT_HPU_LAZY_ACC_PAR_MODE", "0")
+        # todo SW-125782: remove DYNAMIC SHAPE disable WA
+        update_wa_env_var("PT_HPU_ENABLE_REFINE_DYNAMIC_SHAPES", "0")
+        # todo SW-145489: remove WEIGHT CPU PERMUTE WA after SW-145491 is resolved
+        update_wa_env_var("PT_HPU_ENABLE_WEIGHT_CPU_PERMUTE", "0")
 
     # encode world info as base64 to make it easier to pass via command line
     world_info_base64 = encode_world_info(active_resources)

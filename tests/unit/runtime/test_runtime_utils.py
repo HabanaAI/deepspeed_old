@@ -20,14 +20,16 @@ def test_call_to_str():
     assert c2s('hello', 1138, val=3) == 'hello(1138, val=3)'
 
 
+@pytest.mark.xfail(bool(pytest.use_hpu) == True, reason="xfail, due to SW-101074")
 class TestClibGradNorm(DistributedTest):
     world_size = 2
 
     def test(self):
-        param1 = torch.nn.Parameter(torch.Tensor([0]))
-        param1.grad = torch.Tensor([1])
-        param2 = torch.nn.Parameter(torch.Tensor([0]))
-        param2.grad = torch.Tensor([dist.get_rank() + 1])
+        param1 = torch.nn.Parameter(torch.Tensor([0])).cuda()
+        param1.grad = torch.Tensor([1]).cuda()
+        param2 = torch.nn.Parameter(torch.Tensor([0])).cuda()
+        param2.grad = torch.Tensor([dist.get_rank() + 1]).cuda()
+
         # param2 is now MoE parameter
         param2.allreduce = False
 
@@ -39,13 +41,17 @@ class TestClibGradNorm(DistributedTest):
         norm = torch.Tensor([norm]).to(dist.get_rank())
 
         world_size = dist.get_world_size()
-        gathered_norm = [torch.zeros(1).cuda() for i in range(world_size)]
+        if bool(pytest.use_hpu) == True:
+            gathered_norm = [torch.zeros(1).to('hpu') for i in range(world_size)]
+        else:
+            gathered_norm = [torch.zeros(1).cuda() for i in range(world_size)]
 
         dist.all_gather(gathered_norm, norm)
 
         assert gathered_norm[0] == gathered_norm[1], "norm at rank 0 does not match the norm at rank 1"
 
 
+@pytest.mark.xfail(bool(pytest.use_hpu) == True, reason="xfail, due to SW-101074")
 @pytest.mark.parametrize("check_using_norm", [(False), (True)])
 class TestCheckOverflow(DistributedTest):
     world_size = 2

@@ -46,6 +46,12 @@ try:
 except ImportError:
     pass
 
+# Add hpex FusedAdamW to supported list if hpex is installed
+try:
+    from habana_frameworks.torch.hpex.optimizers import FusedAdamW
+    ZERO_SUPPORTED_OPTIMIZERS.append(FusedAdamW)
+except ImportError:
+    pass
 
 def is_zero_supported_optimizer(optimizer):
     if dist.get_rank() == 0:
@@ -60,11 +66,15 @@ def get_lst_from_rank0(lst: List[int]) -> None:
     NOTE: creates both communication and synchronization overhead so should be used
     sparingly
     """
+    if torch.distributed.get_backend() == "hccl":
+        device=torch.device('hpu:0')
+    else:
+        device=torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"]))
     lst_tensor = torch.tensor(
         lst if dist.get_rank() == 0 else [-1] * len(lst),
         dtype=int,
         # device=torch.cuda.current_device(),
-        device=torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"])),
+        device=device,
         requires_grad=False,
     )
     dist.broadcast(lst_tensor, src=0, async_op=False)

@@ -9,6 +9,7 @@ from deepspeed.runtime.zero.config import DeepSpeedZeroConfig
 from unit.common import DistributedTest, get_test_path
 from unit.simple_model import SimpleModel, create_config_from_dict, random_dataloader
 import deepspeed.comm as dist
+from unit.hpu import *
 
 # A test on its own
 import deepspeed
@@ -32,6 +33,7 @@ def base_config():
     return config_dict
 
 
+@pytest.mark.skipif(bool(pytest.use_hpu) == True, reason="CUDA specific test.")
 def test_cuda():
     assert (torch.cuda.is_available())
 
@@ -161,11 +163,22 @@ class TestDeprecatedDeepScaleConfig(DistributedTest):
 
     def test(self, base_config, tmpdir):
 
+        dtype=torch.half
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                base_config["fp16"]["enabled"] = False
+                base_config["fp32"] = {"enabled" : True}
+                dtype=torch.float
+            hpu_flag, msg = is_hpu_supported(base_config)
+            if not hpu_flag:
+                pytest.skip(msg)
         config_path = create_config_from_dict(tmpdir, base_config)
         parser = argparse.ArgumentParser()
         args = parser.parse_args(args='')
         args.deepscale_config = config_path
         args.local_rank = 0
+        if bool(pytest.use_hpu) == True:
+            args.use_hpu = True
 
         hidden_dim = 10
 
@@ -176,7 +189,8 @@ class TestDeprecatedDeepScaleConfig(DistributedTest):
         data_loader = random_dataloader(model=model,
                                         total_samples=5,
                                         hidden_dim=hidden_dim,
-                                        device=model.device)
+                                        device=model.device,
+                                        dtype=dtype)
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
             model.backward(loss)
@@ -188,6 +202,15 @@ class TestDistInit(DistributedTest):
 
     def test(self, base_config):
         hidden_dim = 10
+        dtype=torch.half
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                base_config["fp16"]["enabled"] = False
+                base_config["fp32"] = {"enabled" : True}
+                dtype=torch.float
+            hpu_flag, msg = is_hpu_supported(base_config)
+            if not hpu_flag:
+                pytest.skip(msg)
 
         model = SimpleModel(hidden_dim)
         model, _, _,_ = deepspeed.initialize(config=base_config,
@@ -197,7 +220,8 @@ class TestDistInit(DistributedTest):
         data_loader = random_dataloader(model=model,
                                         total_samples=5,
                                         hidden_dim=hidden_dim,
-                                        device=model.device)
+                                        device=model.device,
+                                        dtype=dtype)
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
             model.backward(loss)
@@ -210,14 +234,23 @@ class TestInitNoOptimizer(DistributedTest):
     def test(self, base_config):
         del base_config["optimizer"]
         hidden_dim = 10
-
+        dtype=torch.half
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                base_config["fp16"]["enabled"] = False
+                base_config["fp32"] = {"enabled" : True}
+                dtype=torch.float
+            hpu_flag, msg = is_hpu_supported(base_config)
+            if not hpu_flag:
+                pytest.skip(msg)
         model = SimpleModel(hidden_dim=hidden_dim)
 
         model, _, _, _ = deepspeed.initialize(config=base_config, model=model)
         data_loader = random_dataloader(model=model,
                                         total_samples=5,
                                         hidden_dim=hidden_dim,
-                                        device=model.device)
+                                        device=model.device,
+                                        dtype=dtype)
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
             with pytest.raises(AssertionError):
@@ -230,22 +263,44 @@ class TestArgs(DistributedTest):
     world_size = 1
 
     def test_none_args(self, base_config):
+        dtype=torch.half
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                base_config["fp16"]["enabled"] = False
+                base_config["fp32"] = {"enabled" : True}
+                dtype=torch.float
+            hpu_flag, msg = is_hpu_supported(base_config)
+            if not hpu_flag:
+                pytest.skip(msg)
+
         model = SimpleModel(hidden_dim=10)
         model, _, _, _ = deepspeed.initialize(args=None, model=model, config=base_config)
         data_loader = random_dataloader(model=model,
                                         total_samples=5,
                                         hidden_dim=10,
-                                        device=model.device)
+                                        device=model.device,
+                                        dtype=dtype)
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
 
     def test_no_args(self, base_config):
+        dtype=torch.half
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                base_config["fp16"]["enabled"] = False
+                base_config["fp32"] = {"enabled" : True}
+                dtype=torch.float
+            hpu_flag, msg = is_hpu_supported(base_config)
+            if not hpu_flag:
+                pytest.skip(msg)
+
         model = SimpleModel(hidden_dim=10)
         model, _, _, _ = deepspeed.initialize(model=model, config=base_config)
         data_loader = random_dataloader(model=model,
                                         total_samples=5,
                                         hidden_dim=10,
-                                        device=model.device)
+                                        device=model.device,
+                                        dtype=dtype)
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
 
@@ -254,7 +309,15 @@ class TestNoModel(DistributedTest):
     world_size = 1
 
     def test(self, base_config):
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                base_config["fp16"]["enabled"] = False
+                base_config["fp32"] = {"enabled" : True}
+            hpu_flag, msg = is_hpu_supported(base_config)
+            if not hpu_flag:
+                pytest.skip(msg)
         model = SimpleModel(hidden_dim=10)
+
         with pytest.raises(AssertionError):
             model, _, _, _ = deepspeed.initialize(model=None, config=base_config)
 

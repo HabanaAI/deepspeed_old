@@ -4,6 +4,7 @@ import pytest
 from unit.common import DistributedTest
 from unit.simple_model import SimplePRMoEModel, SimpleMoEModel, sequence_dataloader
 from unit.util import required_torch_version
+from unit.hpu import *
 
 
 @pytest.mark.parametrize("ep_size", [2, 4])
@@ -23,6 +24,15 @@ class TestMoE(DistributedTest):
             }
         }
         hidden_dim = 16
+        dtype = torch.half
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                config_dict["fp16"]["enabled"] = False
+                config_dict["fp32"] = {"enabled" : True}
+                dtype = torch.float
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
 
         # E+D -- ep_size = 2
         # E only -- ep_size = 4
@@ -37,7 +47,8 @@ class TestMoE(DistributedTest):
         data_loader = sequence_dataloader(model=model,
                                           total_samples=50,
                                           hidden_dim=hidden_dim,
-                                          device=model.device)
+                                          device=model.device,
+                                          dtype=dtype)
 
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
@@ -61,6 +72,15 @@ class TestPRMoE(DistributedTest):
             }
         }
         hidden_dim = 16
+        dtype = torch.half
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                config_dict["fp16"]["enabled"] = False
+                config_dict["fp32"] = {"enabled" : True}
+                dtype = torch.float
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
 
         # E+D -- ep_size = 2
         # E only -- ep_size = 4
@@ -74,7 +94,8 @@ class TestPRMoE(DistributedTest):
         data_loader = sequence_dataloader(model=model,
                                           total_samples=50,
                                           hidden_dim=hidden_dim,
-                                          device=model.device)
+                                          device=model.device,
+                                          dtype=dtype)
 
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])

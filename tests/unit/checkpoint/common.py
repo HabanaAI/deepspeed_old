@@ -32,8 +32,13 @@ def compare_model_states(saved_model,
         np1, p1 = p1
         if 'deepspeed_moe.gate.wg' in np0:
             # these params are converted to float at runtime, cast to half for comparison
-            p1 = p1.half()
-            p0 = p0.half()
+            if bool(pytest.use_hpu) == True:
+                if not os.getenv("REPLACE_FP16", default=None):
+                    p1 = p1.half()
+                    p0 = p0.half()
+            else:
+                p1 = p1.half()
+                p0 = p0.half()
         assert id(p0) != id(p1), f'Comparing fp16 model state tensor against itself : {id(p0)} <====> {id(p1)}'
         try:
             assert torch.allclose(p0, p1, atol=1e-07), f"FP16 model state {p0} is not equal to {p1}, names:{np0}, {np1}"

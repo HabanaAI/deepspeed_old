@@ -1,6 +1,7 @@
 import os
 import json
 import argparse
+import pytest
 import torch
 
 from deepspeed.pipe import PipelineModule, LayerSpec
@@ -154,8 +155,7 @@ class LinearStackPipe(PipelineModule):
                           bias=False))
             layers.append(lambda x: x)
         layers.append(LayerSpec(torch.nn.Linear, self.hidden_dim, self.output_dim))
-
-        super().__init__(layers=layers, loss_fn=torch.nn.CrossEntropyLoss(), **kwargs)
+        super().__init__(layers=layers, loss_fn=torch.nn.CrossEntropyLoss(), use_hpu=(bool(pytest.use_hpu) == True), **kwargs)
 
 
 class SimpleOptimizer(torch.optim.Optimizer):
@@ -272,7 +272,11 @@ def create_deepspeed_args():
     args.deepspeed = True
     if dist.is_initialized():
         # We assume up to one full node executing unit tests
-        assert dist.get_world_size() <= torch.cuda.device_count()
+        if bool(pytest.use_hpu) == True:
+            from habana_frameworks.torch.hpu import device_count
+            assert dist.get_world_size() <= device_count()
+        else:
+            assert dist.get_world_size() <= torch.cuda.device_count()
         args.local_rank = dist.get_rank()
     return args
 

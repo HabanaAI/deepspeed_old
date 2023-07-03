@@ -7,7 +7,6 @@ from .utils import *
 from .backend import *
 from .comm import *
 
-
 class TorchBackend(Backend):
     """
         A light-weight wrapper class for torch.distributed API.
@@ -31,6 +30,8 @@ class TorchBackend(Backend):
 
     def init_process_group(self, backend, timeout, init_method):
         if not torch.distributed.is_initialized():
+            if backend == "hccl":
+                import habana_frameworks.torch.distributed.hccl
             torch.distributed.init_process_group(backend,
                                                  timeout=timeout,
                                                  init_method=init_method)

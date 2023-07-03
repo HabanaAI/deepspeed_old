@@ -103,9 +103,14 @@ class TestDistAllReduce(DistributedTest):
     world_size = [1, 2, 4]
 
     def test(self):
-        x = torch.ones(1, 3).cuda() * (dist.get_rank() + 1)
-        sum_of_ranks = (dist.get_world_size() * (dist.get_world_size() + 1)) // 2
-        result = torch.ones(1, 3).cuda() * sum_of_ranks
+        if bool(pytest.use_hpu) == True:
+            x = torch.ones(1, 3).to("hpu") * (dist.get_rank() + 1)
+            sum_of_ranks = (dist.get_world_size() * (dist.get_world_size() + 1)) // 2
+            result = torch.ones(1, 3).to("hpu") * sum_of_ranks
+        else:
+            x = torch.ones(1, 3).cuda() * (dist.get_rank() + 1)
+            sum_of_ranks = (dist.get_world_size() * (dist.get_world_size() + 1)) // 2
+            result = torch.ones(1, 3).cuda() * sum_of_ranks
         dist.all_reduce(x)
         assert torch.all(x == result)
 
@@ -115,16 +120,28 @@ class TestDistInit(DistributedTest):
     init_distributed = False
 
     def test_already_init(self, dist_init_required):
-        torch.distributed.init_process_group('nccl')
-        deepspeed.init_distributed('nccl', dist_init_required=dist_init_required)
+        if bool(pytest.use_hpu) == True:
+            import habana_frameworks.torch.distributed.hccl
+            torch.distributed.init_process_group('hccl')
+            deepspeed.init_distributed('hccl', dist_init_required=dist_init_required)
+        else:
+            torch.distributed.init_process_group('nccl')
+            deepspeed.init_distributed('nccl', dist_init_required=dist_init_required)
 
     def test_no_init(self, dist_init_required):
         if dist_init_required or dist_init_required is None:
-            deepspeed.init_distributed('nccl', dist_init_required=dist_init_required)
+            if bool(pytest.use_hpu) == True:
+                import habana_frameworks.torch.distributed.hccl
+                deepspeed.init_distributed('hccl', dist_init_required=dist_init_required)
+            else:
+                deepspeed.init_distributed('nccl', dist_init_required=dist_init_required)
         else:
             # torch.dist is not done and for some reason the user says they don't want it done
             with pytest.raises(Exception):
-                deepspeed.init_distributed('nccl', dist_init_required=dist_init_required)
+                if bool(pytest.use_hpu) == True:
+                    deepspeed.init_distributed('hccl', dist_init_required=dist_init_required)
+                else:
+                    deepspeed.init_distributed('nccl', dist_init_required=dist_init_required)
 
 
 class TestDistInitNoEnv(DistributedTest):
@@ -133,13 +150,17 @@ class TestDistInitNoEnv(DistributedTest):
     set_dist_env = False
 
     def test(self):
+        backend = 'nccl'
+        if bool(pytest.use_hpu) == True:
+            import habana_frameworks.torch.distributed.hccl
+            backend = 'hccl'
         torch.distributed.init_process_group(
-            backend='nccl',
+            backend=backend,
             init_method=f"tcp://127.0.0.1:{get_master_port()}",
             world_size=1,
             rank=0)
         assert torch.distributed.is_initialized()
-        deepspeed.init_distributed('nccl', auto_mpi_discovery=True)
+        deepspeed.init_distributed(backend, auto_mpi_discovery=True)
 
 
 @pytest.mark.parametrize("dist_init_required", [True, False])
@@ -147,7 +168,11 @@ class TestDistInitWithModel(DistributedTest):
     init_distributed = False
 
     def test_already_init(self, dist_init_required):
-        torch.distributed.init_process_group('nccl')
+        backend = 'nccl'
+        if bool(pytest.use_hpu) == True:
+            import habana_frameworks.torch.distributed.hccl
+            backend = 'hccl'
+        torch.distributed.init_process_group(backend)
         model = SimpleModel(4)
         config_dict = {
             "train_micro_batch_size_per_gpu": 1,

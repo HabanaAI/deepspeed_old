@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Dict
 import torch
 
@@ -259,7 +260,7 @@ class DeepSpeedCheckpoint(object):
         #print(f"{transformer_layer_keys} {layers_per_pp}")
         for key_index, layer_key in enumerate(transformer_layer_keys):
             pp_index = key_index // layers_per_pp
-            layer_files = get_files_with_prefix(self.layer_files, layer_key)
+            layer_files = get_files_with_prefix(self.layer_files, layer_key + '-')
             layer_file_partitions = partition_data(layer_files, self.tp_degree)
             for tp_index in range(self.tp_degree):
                 map_key = (tp_index, pp_index)
@@ -284,11 +285,13 @@ class DeepSpeedCheckpoint(object):
 
     def _get_layer_keys(self):
         key_set = set()
-        key_len = len(LAYER_FILE_PREFIX) + 2
         for file_path in self.layer_files:
             _, fname = os.path.split(file_path)
-            key_set.add(fname[:key_len])
-        return sorted(list(key_set))
+            layer_id = re.search('layer_(\d+)-model_.*', fname).group(1)
+            key_set.add(layer_id)
+        sorted_ids = sorted(list(key_set), key=int)
+        layer_keys = [LAYER_FILE_PREFIX + str(layer_id) for layer_id in sorted_ids]
+        return layer_keys
 
     def _merge_state_dicts(self, sd_list):
         merged_sd = {}

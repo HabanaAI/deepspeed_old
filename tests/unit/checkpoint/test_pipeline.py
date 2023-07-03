@@ -3,7 +3,7 @@ from unit.common import DistributedTest
 from unit.simple_model import *
 
 from unit.checkpoint.common import checkpoint_correctness_verification
-
+from unit.hpu import *
 import pytest
 
 
@@ -45,13 +45,24 @@ class TestPipelineCheckpoint(DistributedTest):
                 }
             }
         }
+        fp16=config_dict['fp16']['enabled']
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                config_dict["fp16"]["enabled"] = False
+                config_dict["fp32"] = {"enabled" : True}
+                if zero_stage == 1:
+                    config_dict["communication_data_type"] = 'bfp16'
+                fp16=False
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
 
         models = [LinearStackPipe(num_stages=2) for _ in range(2)]
         checkpoint_correctness_verification(config_dict=config_dict,
                                             models=models,
                                             hidden_dim=models[0].hidden_dim,
                                             tmpdir=tmpdir,
-                                            fp16=config_dict['fp16']['enabled'],
+                                            fp16=fp16,
                                             load_optimizer_states=True,
                                             load_lr_scheduler_states=True,
                                             train_batch=True)

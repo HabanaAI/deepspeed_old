@@ -11,6 +11,70 @@ from enum import Enum
 import functools
 import itertools
 from typing import List
+from deepspeed.runtime.utils import get_use_hpu
+
+def get_stream(stream, use_hpu, no_cuda):
+    assert use_hpu or not no_cuda, "get_stream only supported for hpu or cuda devices"
+    if use_hpu:
+        return habana_frameworks.torch.hpu.stream(stream)
+    elif not no_cuda:
+        return torch.cuda.stream(stream)
+
+def create_stream(use_hpu, no_cuda):
+    assert use_hpu or not no_cuda, "create_stream only supported for hpu or cuda devices"
+    if use_hpu:
+        return habana_frameworks.torch.hpu.Stream()
+    elif not no_cuda:
+        return torch.cuda.Stream()
+
+def get_default_stream(use_hpu, no_cuda):
+    assert use_hpu or not no_cuda, "default_stream only supported for hpu or cuda devices"
+    if use_hpu:
+        return habana_frameworks.torch.hpu.default_stream()
+    elif not no_cuda:
+        return torch.cuda.default_stream()
+
+def get_current_stream(use_hpu, no_cuda):
+    assert use_hpu or not no_cuda, "current_stream only supported for hpu or cuda devices"
+    if use_hpu:
+        return habana_frameworks.torch.hpu.current_stream()
+    elif not no_cuda:
+        return torch.cuda.current_stream()
+
+def record_stream(tensor, use_hpu, no_cuda):
+    if tensor.is_cuda:
+        # need to make sure that we don't free the parameter while it is still
+        # being used for computation
+        tensor.record_stream(torch.cuda.current_stream())
+    elif tensor.device.type == "hpu":
+        # synchronize_device(use_hpu, no_cuda)
+        habana_frameworks.torch.core.mark_step()
+
+def create_event(use_hpu, no_cuda):
+    assert use_hpu or not no_cuda, "create_event only supported for hpu or cuda devices"
+    event = None
+    if use_hpu:
+        event = habana_frameworks.torch.core.hpu.Event()
+    elif not no_cuda:
+        event = torch.cuda.Event()
+    return event
+
+def get_current_device(use_hpu, no_cuda):
+    if use_hpu:
+        device_str = 'hpu:' + str(habana_frameworks.torch.hpu.current_device())
+    elif not no_cuda:
+        device_str = 'cuda:' + str(torch.cuda.current_device())
+    else:
+        device_str = 'cpu'
+    return torch.device(device_str)
+
+def synchronize_device(use_hpu, no_cuda):
+    assert use_hpu or not no_cuda, "synchronize_device only supported for hpu or cuda devices"
+    if use_hpu:
+        habana_frameworks.torch.core.mark_step()
+        habana_frameworks.torch.hpu.synchronize()
+    elif not no_cuda:
+        torch.cuda.synchronize()
 
 import torch
 from torch import Tensor
@@ -21,7 +85,7 @@ from torch.nn import Parameter
 from .linear import zero3_linear_wrap
 
 import deepspeed
-from ..utils import get_only_unique_item, see_memory_usage
+from ..utils import get_only_unique_item, see_memory_usage, get_use_hpu
 from deepspeed.runtime.zero.utils import assert_ints_same_as_other_ranks
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
 from deepspeed.utils import instrument_w_nvtx, logger
@@ -191,7 +255,11 @@ def zero_wrapper_for_fp_tensor_constructor(fn: Callable,
                                            target_fp_dtype: torch.dtype) -> Callable:
     def wrapped_fn(*args, **kwargs) -> Tensor:
         if kwargs.get("device", None) is None:
-            kwargs['device'] = torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"]))
+            if get_use_hpu():
+                kwargs['device'] = 'hpu'
+            else:
+                kwargs['device'] = torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"]))
+
         tensor: Tensor = fn(*args, **kwargs)
         if tensor.is_floating_point():
             tensor = tensor.to(target_fp_dtype)
@@ -228,13 +296,13 @@ def get_all_subclasses(cls):
 
 
 @instrument_w_nvtx
-def free_param(param: Parameter) -> None:
+def free_param(param: Parameter, use_hpu, no_cuda) -> None:
     """Free underlying storage of a parameter."""
     assert not param.ds_active_sub_modules, param.ds_summary()
-    if param.data.is_cuda:
+    if param.data.is_cuda or param.data.device.type == "hpu":
         # need to make sure that we don't free the parameter while it is still
         # being used for computation
-        param.data.record_stream(torch.cuda.current_stream())
+        record_stream(param.data, use_hpu, no_cuda)
     # param.data doesn't store anything meaningful in partitioned state
     param.data = torch.empty(0, dtype=param.dtype, device=param.device)
     param.ds_status = ZeroParamStatus.NOT_AVAILABLE
@@ -488,12 +556,16 @@ class AllGatherCoalescedHandle:
         params: List[Parameter],
         partitions: List[Tensor],
         world_size: int,
+        use_hpu=False,
+        no_cuda=False
     ) -> None:
         self.__allgather_handle = allgather_handle
         self.__params = params
         self.__partitions = partitions
         self.__world_size = world_size
         self.__complete = False
+        self.use_hpu = use_hpu
+        self.no_cuda = no_cuda
 
         for param in self.__params:
             if param.ds_status != ZeroParamStatus.INFLIGHT:
@@ -526,7 +598,7 @@ class AllGatherCoalescedHandle:
             param.ds_status = ZeroParamStatus.AVAILABLE
 
             for part_to_copy in partitions:
-                part_to_copy.record_stream(torch.cuda.current_stream())
+                record_stream(part_to_copy, self.use_hpu, self.no_cuda)
 
             param_offset += param.ds_tensor.ds_numel
 
@@ -547,7 +619,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                  config=None,
                  enabled=True,
                  dtype=None,
-                 mpu=None):
+                 mpu=None,
+                 use_hpu=None,
+                 no_cuda=False):
         """A context to enable massive model construction for training with
         ZeRO-3. Models are automatically partitioned (or, sharded) across the
         system and converted to half precision.
@@ -659,21 +733,35 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                          mem_efficient_linear=mem_efficient_linear,
                          ds_config=_ds_config,
                          dtype=dtype)
+        if use_hpu == None:
+            self.use_hpu = get_use_hpu()
+        else:
+            self.use_hpu = use_hpu
         if not dist.is_initialized():
-            init_distributed()
+            if self.use_hpu:
+                init_distributed(dist_backend="hccl")
+            else:
+                init_distributed()
             assert dist.is_initialized(), "Parameters cannot be scattered without initializing deepspeed.comm"
         if data_parallel_group is None:
             self.ds_process_group = dist.get_world_group()
         else:
             self.ds_process_group = data_parallel_group
 
+        self.no_cuda = no_cuda
         self.rank = dist.get_rank(group=self.ds_process_group)
         self.world_size = dist.get_world_size(group=self.ds_process_group)
 
         # Local device is the device where the parameters are consumed, must be default device.
         # It is the device where parameters are fully instantiated using allgather
-        self.local_device = torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"]))
-        torch.cuda.set_device(self.local_device)
+        if self.use_hpu:
+            global habana_frameworks
+            import habana_frameworks
+            self.local_device = torch.device('hpu:0')
+        else:
+            self.local_device = torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"]))
+            torch.cuda.set_device(self.local_device)
+
 
         if _ds_config is not None and _ds_config.zero_config.offload_param is not None:
             remote_device = _ds_config.zero_config.offload_param.device
@@ -747,8 +835,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     f"Partitioning param {debug_param2name_id_shape(param)} module={debug_module2name(module)}"
                 )
 
-                if param.is_cuda:
-                    dist.broadcast(param, 0, self.ds_process_group)
+                if param.is_cuda or param.data.device.type == "hpu":
+                    #TODO:[SW-139509] bridge should handle correctly tensors' addresses and data that
+                    # are used for async collective ops - thus preventing from sync issues and race conditions.
+                    # Once it is fixed - remove this WA (change param.data back to param)
+                    dist.broadcast(param.data, 0, self.ds_process_group)
                 else:
                     if dist.get_rank() == 0:
                         logger.warn(f"param `{name}` in {module.__class__.__name__} "
@@ -839,11 +930,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 param_buffer = torch.empty(
                     math.ceil(param.ds_numel / self.world_size) * self.world_size,
                     dtype=param.dtype,
-                    device=torch.cuda.current_device(),
+                    device=get_current_device(self.use_hpu, self.no_cuda),
                     requires_grad=False,
                 )
                 handle = _dist_allgather_fn(
-                    param.ds_tensor.to(torch.cuda.current_device()),
+                    param.ds_tensor.to(get_current_device(self.use_hpu, self.no_cuda)),
                     param_buffer,
                     self.ds_process_group)
                 param.data = param_buffer.narrow(0,
@@ -856,7 +947,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 flat_tensor = torch.empty(partition_sz * self.world_size,
                                           dtype=get_only_unique_item(p.dtype
                                                                      for p in params),
-                                          device=torch.cuda.current_device(),
+                                          device=get_current_device(self.use_hpu, self.no_cuda),
                                           requires_grad=False)
                 partitions: List[Parameter] = []
                 for i in range(self.world_size):
@@ -866,7 +957,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                            partition_sz))
 
                 instrument_w_nvtx(torch.cat)(
-                    [p.ds_tensor.to(torch.cuda.current_device()) for p in params],
+                    [p.ds_tensor.to(get_current_device(self.use_hpu, self.no_cuda)) for p in params],
                     out=partitions[self.rank])
                 handle = _dist_allgather_fn(partitions[self.rank],
                                             flat_tensor,
@@ -877,6 +968,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     params=params,
                     partitions=partitions,
                     world_size=self.world_size,
+                    use_hpu=self.use_hpu,
+                    no_cuda=self.no_cuda
                 )
 
         def partition(param_list=None, hierarchy=0, has_been_updated=False):
@@ -1067,7 +1160,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     f'Before partitioning param {param.ds_id} {param.shape}',
                     force=False)
                 # param.data does not store anything meaningful in partitioned state
-                free_param(param)
+                free_param(param, self.use_hpu, self.no_cuda)
                 see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}',
                                  force=False)
 
@@ -1103,7 +1196,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                         device=OffloadDeviceEnum.cpu if self.remote_device
                         == OffloadDeviceEnum.nvme else self.remote_device)
                     if self.pin_memory:
-                        partitioned_tensor = partitioned_tensor.pin_memory()
+                        partitioned_tensor = partitioned_tensor.pin_memory(
+                            get_current_device(self.use_hpu, self.no_cuda)) if self.use_hpu else partitioned_tensor.pin_memory()
 
                 partitioned_tensor.requires_grad = False
                 param.ds_tensor = partitioned_tensor
@@ -1147,7 +1241,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
             see_memory_usage(f'Before partitioning param {param.ds_id} {param.shape}',
                              force=False)
-            free_param(param)
+            free_param(param, self.use_hpu, self.no_cuda)
             see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}',
                              force=False)
 
@@ -1195,7 +1289,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             f'After allocate allgather param {debug_param2name_id_shape_status(param)} {aligned_param_size} {partition_size} ',
             force=False)
 
-        torch.cuda.synchronize()
+        if self.use_hpu:
+            habana_frameworks.torch.core.mark_step()
+        else:
+            synchronize_device(self.use_hpu, self.no_cuda)
 
         print_rank_0(
             f"{'--'* hierarchy}----allgather param with {debug_param2name_id_shape_status(param)} partition size={partition_size}"
@@ -1209,7 +1306,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         if self.use_all_gather_base:
             # try the _all_gather_base on PyTorch master branch
             handle = dist.all_gather_base(flat_tensor,
-                                          param.ds_tensor.cuda(),
+                                           param.ds_tensor.to(self.local_device),
                                           group=self.ds_process_group,
                                           async_op=async_op)
         else:
@@ -1243,7 +1340,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         local_tensors = []
         for param in param_list:
             partition_sizes.append(param.ds_tensor.ds_numel)
-            local_tensors.append(param.ds_tensor.cuda())
+            local_tensors.append(param.ds_tensor.to(self.local_device))
 
         # allocate memory for allgather params
         allgather_params = []
@@ -1274,7 +1371,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     psize = partition_sizes[param_idx]
                     partition = allgather_params[param_idx].narrow(0, i * psize, psize)
                     output_list.append(partition)
-                    if not partition.is_cuda:
+                    if not partition.is_cuda and not param.data.device.type == "hpu":
                         logger.warning(
                             f'param {param_idx}, partition {i} is not on CUDA, partition shape {partition.size()}'
                         )
@@ -1297,7 +1394,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                                 param.ds_numel).view(param.ds_shape).data
 
         # guarantee the communication to be completed
-        torch.cuda.synchronize()
+        if self.use_hpu:
+            habana_frameworks.torch.core.mark_step()
+        else:
+            synchronize_device(self.use_hpu, self.no_cuda)
 
         return None
 

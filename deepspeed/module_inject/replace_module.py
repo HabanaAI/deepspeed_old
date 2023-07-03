@@ -18,8 +18,15 @@ from .load_checkpoint import load_model_with_checkpoint
 import time
 
 
+def move(tensor, device):
+    if tensor.is_meta:
+        return torch.empty_like(tensor, device=device)
+    else:
+        return tensor.to(device=device)
+
+
 class ReplaceWithTensorSlicing:
-    def __init__(self, mp_group=None, mp_size=1, out_dim=1, in_dim=0):
+    def __init__(self, mp_group=None, mp_size=1, out_dim=1, in_dim=0, device=None):
         if mp_group is not None:
             self.gpu_index = dist.get_rank(group=mp_group)
         else:
@@ -27,6 +34,7 @@ class ReplaceWithTensorSlicing:
         self.out_dim = out_dim
         self.in_dim = in_dim
         self.mp_size = mp_size
+        self.device = device
 
     def merge_assert(self, dim1, dim2):
         assert dim1 > dim2, \
@@ -62,10 +70,10 @@ class ReplaceWithTensorSlicing:
                               axis=self.out_dim) for i in range(len(qkv_split[0]))
                 ]
                 dst.data.copy_(weight_split[self.gpu_index].to(
-                    torch.cuda.current_device()).contiguous())
+                    self.device).contiguous())
             else:
                 dst.data.copy_(src_split[self.gpu_index].to(
-                    torch.cuda.current_device()).contiguous())
+                    self.device).contiguous())
         else:
             if src_shape[0] == dst_shape[0]:
                 return torch.nn.parameter.Parameter(src)
@@ -77,10 +85,10 @@ class ReplaceWithTensorSlicing:
                               axis=0) for i in range(len(qkv_split[0]))
                 ]
                 dst.data.copy_(bias_split[self.gpu_index].to(
-                    torch.cuda.current_device()).contiguous())
+                    self.device).contiguous())
             else:
                 dst.data.copy_(src_split[self.gpu_index].to(
-                    torch.cuda.current_device()).contiguous())
+                    self.device).contiguous())
 
         return torch.nn.parameter.Parameter(dst)
 
@@ -89,34 +97,32 @@ class ReplaceWithTensorSlicing:
             return src
         src_shape = src.shape
         dst_shape = dst.shape
-        if (len(src_shape) == 2 and len(dst_shape) == 2):
+        with torch.no_grad():
+            if (len(src_shape) == 2 and len(dst_shape) == 2):
 
-            if src_shape[0] == dst_shape[0] and src_shape[1] == dst_shape[1]:
-                dst.data.copy_(src)
-            else:
-                if src_shape[self.in_dim] != dst_shape[self.in_dim]:
-                    self.merge_assert(src_shape[self.in_dim], dst_shape[self.in_dim])
-                    weight_split = torch.split(
-                        src,
-                        dst_shape[self.in_dim],
-                        dim=self.in_dim)[self.gpu_index].to(
-                            torch.cuda.current_device()).contiguous()
+                if src_shape[0] == dst_shape[0] and src_shape[1] == dst_shape[1]:
+                    dst.copy_(src)
                 else:
-                    self.merge_assert(src_shape[self.out_dim], dst_shape[self.out_dim])
-                    weight_split = torch.split(
-                        src.data,
-                        dst_shape[self.out_dim],
-                        dim=self.out_dim)[self.gpu_index].to(
-                            torch.cuda.current_device()).contiguous()
-                dst.data.copy_(weight_split.contiguous())
-        else:
-            if src_shape[0] == dst_shape[0]:
-                dst.data.copy_(src)
+                    if src_shape[self.in_dim] != dst_shape[self.in_dim]:
+                        self.merge_assert(src_shape[self.in_dim], dst_shape[self.in_dim])
+                        weight_split = torch.split(
+                            src,
+                            dst_shape[self.in_dim],
+                            dim=self.in_dim)[self.gpu_index].contiguous()
+                    else:
+                        self.merge_assert(src_shape[self.out_dim], dst_shape[self.out_dim])
+                        weight_split = torch.split(
+                            src,
+                            dst_shape[self.out_dim],
+                            dim=self.out_dim)[self.gpu_index]
+                    dst.copy_(weight_split.contiguous())
             else:
-                bias_split = torch.split(src.data,
-                                         dst_shape[-1])[self.gpu_index].to(
-                                             torch.cuda.current_device()).contiguous()
-                dst.data.copy_(bias_split)
+                if src_shape[0] == dst_shape[0]:
+                    dst.copy_(src)
+                else:
+                    bias_split = torch.split(src, dst_shape[-1])[self.gpu_index].contiguous()
+                    dst.copy_(bias_split)
+        dst = move(dst, self.device)
         dst = torch.nn.parameter.Parameter(dst, requires_grad=False)
         if hasattr(src, 'scale'):
             dst.scale = src.scale
@@ -297,7 +303,8 @@ def replace_transformer_layer(orig_layer_impl,
                               model,
                               checkpoint_dict,
                               config,
-                              model_config):
+                              model_config,
+                              use_hpu=False):
     """ Replace bert-style transformer layers with DeepSpeed's transformer layer
     Arguments:
         orig_layer_impl (torch.nn.Module): the original transformer layer implementation to look for,
@@ -322,9 +329,15 @@ def replace_transformer_layer(orig_layer_impl,
     seed = -1
     local_rank = -1
 
+    if use_hpu:
+        device = torch.device("hpu")
+    else:
+        device = torch.cuda.current_device()
+
     mp_replace = ReplaceWithTensorSlicing(
         mp_group=config.tensor_parallel.tp_group,
-        mp_size=config.tensor_parallel.tp_size)  #, out_dim=0, in_dim=1)
+        mp_size=config.tensor_parallel.tp_size,
+        device=device)  #, out_dim=0, in_dim=1)
 
     def replace_with_policy(child,
                             policy_cls,
@@ -735,12 +748,12 @@ def replace_transformer_layer(orig_layer_impl,
             new_module.output_b.data = _4hh_b
         return new_module
 
-    def replace_wo_policy(module, all_reduce_linears):
+    def replace_wo_policy(module, all_reduce_linears, device):
         mp_size = config.tensor_parallel.tp_size
         mp_group = config.tensor_parallel.tp_group
 
         def _replace(child, name, conv_linear_layer):
-            mp_replace = ReplaceWithTensorSlicing(mp_group=mp_group)
+            mp_replace = ReplaceWithTensorSlicing(mp_group=mp_group,device=device)
             z_inference = (len(list(child.parameters())) > 0) and (list(
                 child.parameters())[0].numel() == 0)
             if z_inference:
@@ -777,7 +790,7 @@ def replace_transformer_layer(orig_layer_impl,
                 elif child.bias is not None:
                     new_bias.data.copy_(child.bias.data)
                 return LinearAllreduce(data, child.bias if child.bias is None else \
-                            torch.nn.parameter.Parameter(new_bias.to(torch.cuda.current_device())), mp_group)
+                            torch.nn.parameter.Parameter(move(new_bias, device)), mp_group)
             else:
                 new_weight = torch.empty((
                     (weight_shape[1] if conv_linear_layer else weight_shape[0]) //
@@ -798,7 +811,7 @@ def replace_transformer_layer(orig_layer_impl,
                     if conv_linear_layer:
                         child.weight.data = child.weight.data.transpose(-1,
                                                                         -2).contiguous()
-                    data = mp_replace.copy(new_weight, child.weight.data)
+                    data = mp_replace.copy(new_weight, child.weight)
 
                 new_bias = torch.empty((weight_shape[0] // mp_size),
                                        device=child.weight.device,
@@ -807,16 +820,15 @@ def replace_transformer_layer(orig_layer_impl,
                     with deepspeed.zero.GatheredParameters(child.bias, modifier_rank=0):
                         bias_data = None if child.bias is None else mp_replace.copy(
                             new_bias,
-                            child.bias.data).to(torch.cuda.current_device())
+                            child.bias.data).to(device)
                 else:
-                    bias_data = None if child.bias is None else mp_replace.copy(
+                    bias_data = None if child.bias is None else move(mp_replace.copy(
                         new_bias,
-                        child.bias.data).to(torch.cuda.current_device())
-                return LinearLayer(weight=data.to(torch.cuda.current_device()),
-                                   bias=bias_data)
+                        child.bias.data), device)
+                return LinearLayer(weight=move(data, device), bias=bias_data,device=device)
 
         def _slice_embedding(child, name, conv_linear_layer):
-            mp_replace = ReplaceWithTensorSlicing(mp_group=mp_group)
+            mp_replace = ReplaceWithTensorSlicing(mp_group=mp_group, device=device)
             new_weight = torch.empty((child.weight.shape[0],
                                       child.weight.shape[1] // mp_size),
                                      device=child.weight.device,
@@ -892,7 +904,7 @@ def replace_transformer_layer(orig_layer_impl,
                                                  inference=True,
                                                  layer_id=layer_id)
             else:
-                new_module = replace_wo_policy(child, _policy)
+                new_module = replace_wo_policy(child, _policy, device=device)
 
         return new_module
 
@@ -929,9 +941,10 @@ def replace_transformer_layer(orig_layer_impl,
                     mp_replace,
                     ckpt_type,
                     quantizer,
-                    param_names=selected_policy_g.get_param_names(),
+                    param_names=selected_policy_g.get_param_names() if selected_policy_g else None,
                     transformer_config=transformer_config_g,
-                    megatron_v2=megatron_v2_g)
+                    megatron_v2=megatron_v2_g,
+                    device=device)
                 pbar.update(1)
         else:
             import gc
@@ -962,9 +975,10 @@ def replace_transformer_layer(orig_layer_impl,
                     ckpt_type,
                     quantizer,
                     int(rank % tp_split_size),
-                    param_names=selected_policy_g.get_param_names(),
+                    param_names=selected_policy_g.get_param_names() if selected_policy_g else None,
                     transformer_config=transformer_config_g,
-                    megatron_v2=megatron_v2_g)
+                    megatron_v2=megatron_v2_g,
+                    device=device)
                 sds = [None for _ in sds]
                 gc.collect()
 
@@ -986,9 +1000,9 @@ def replace_transformer_layer(orig_layer_impl,
                         ckpt_type,
                         quantizer,
                         int(rank % tp_split_size),
-                        param_names=selected_policy_g.get_param_names(),
+                        param_names=selected_policy_g.get_param_names() if selected_policy_g else None,
                         transformer_config=transformer_config_g,
-                        megatron_v2=megatron_v2_g)
+                        megatron_v2=megatron_v2_g, device=device)
                     sds = [None for _ in sds]
                     gc.collect()
         print(f"checkpoint loading time at rank {rank}: {time.time()-start_time} sec")

@@ -3,6 +3,7 @@ from deepspeed.ops.op_builder import CPUAdamBuilder
 
 from unit.common import DistributedTest, DistributedFixture
 from unit.simple_model import *
+from unit.hpu import *
 from unit.util import required_minimum_torch_version
 
 from unit.checkpoint.common import *
@@ -61,9 +62,24 @@ class TestZeROCheckpoint(DistributedTest):
             }
         }
         hidden_dim = 10
+        fp16=True
+        use_hpu = None
+        zero3_init_dtype=None
+        if bool(pytest.use_hpu) == True:
+            use_hpu = True
+            if os.getenv("REPLACE_FP16", default=None):
+                config_dict["fp16"]["enabled"] = False
+                config_dict["fp32"] = {"enabled" : True}
+                if zero_stage == 1:
+                    config_dict["communication_data_type"] = 'bfp16'
+                fp16=False
+                zero3_init_dtype=torch.float32
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
 
         if zero_stage == 3:
-            with deepspeed.zero.Init():
+            with deepspeed.zero.Init(use_hpu=use_hpu, dtype=zero3_init_dtype):
                 models = [SimpleModel(hidden_dim, empty_grad=False) for _ in range(2)]
         else:
             models = [SimpleModel(hidden_dim, empty_grad=False) for _ in range(2)]
@@ -72,6 +88,7 @@ class TestZeROCheckpoint(DistributedTest):
                                             models,
                                             hidden_dim,
                                             tmpdir,
+                                            fp16=fp16,
                                             load_optimizer_states=True)
 
     @pytest.mark.parametrize('zero_stage, use_cpu_offload, adam_optimizer',
@@ -120,11 +137,26 @@ class TestZeROCheckpoint(DistributedTest):
             }
         }
         hidden_dim = 10
+        fp16=True
+        use_hpu = None
+        zero3_init_dtype=None
+        if bool(pytest.use_hpu) == True:
+            use_hpu = True
+            if os.getenv("REPLACE_FP16", default=None):
+                config_dict["fp16"]["enabled"] = False
+                config_dict["fp32"] = {"enabled" : True}
+                if zero_stage == 1:
+                    config_dict["communication_data_type"] = 'bfp16'
+                fp16=False
+                zero3_init_dtype=torch.float32
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
 
         if zero_stage == 3:
             global DeepSpeedZeroOptimizer_Stage3
             from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
-            with deepspeed.zero.Init():
+            with deepspeed.zero.Init(use_hpu=use_hpu, dtype=zero3_init_dtype):
                 models = [SimpleModel(hidden_dim, empty_grad=False) for _ in range(2)]
         else:
             models = [SimpleModel(hidden_dim, empty_grad=False) for _ in range(2)]
@@ -133,6 +165,7 @@ class TestZeROCheckpoint(DistributedTest):
                                             models,
                                             hidden_dim,
                                             tmpdir,
+                                            fp16=fp16,
                                             load_optimizer_states=False)
 
     @pytest.mark.parametrize('zero_stage', [1, 2])
@@ -151,6 +184,18 @@ class TestZeROCheckpoint(DistributedTest):
             }
         }
         hidden_dim = 10
+        fp16=True
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                config_dict["fp16"]["enabled"] = False
+                config_dict["fp32"] = {"enabled" : True}
+                if zero_stage == 1:
+                    config_dict["communication_data_type"] = 'bfp16'
+                fp16=False
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
+
         models = [SimpleModel(hidden_dim=hidden_dim) for _ in range(2)]
         optimizers = [HybridStateOptimizer(model.parameters()) for model in models]
 
@@ -159,6 +204,7 @@ class TestZeROCheckpoint(DistributedTest):
                                             base_optimizers=optimizers,
                                             hidden_dim=hidden_dim,
                                             tmpdir=tmpdir,
+                                            fp16=fp16,
                                             load_optimizer_states=True)
 
     @pytest.mark.parametrize('zero_stage', [0, 1, 2, 3])
@@ -177,9 +223,24 @@ class TestZeROCheckpoint(DistributedTest):
             }
         }
         hidden_dim = 10
+        fp16=True
+        use_hpu = None
+        zero3_init_dtype=None
+        if bool(pytest.use_hpu) == True:
+            use_hpu = True
+            if os.getenv("REPLACE_FP16", default=None):
+                config_dict["fp16"]["enabled"] = False
+                config_dict["fp32"] = {"enabled" : True}
+                if zero_stage == 1:
+                    config_dict["communication_data_type"] = 'bfp16'
+                fp16=False
+                zero3_init_dtype=torch.float32
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
 
         if zero_stage == 3:
-            with deepspeed.zero.Init():
+            with deepspeed.zero.Init(use_hpu=use_hpu, dtype=zero3_init_dtype):
                 models = [SimpleModel(hidden_dim, empty_grad=False) for _ in range(2)]
         else:
             models = [SimpleModel(hidden_dim, empty_grad=False) for _ in range(2)]
@@ -188,6 +249,7 @@ class TestZeROCheckpoint(DistributedTest):
                                             models,
                                             hidden_dim,
                                             tmpdir,
+                                            fp16=fp16,
                                             load_module_only=True)
 
 
@@ -212,13 +274,25 @@ class ws4_model_checkpoint(DistributedFixture):
         hidden_dim = 10
         model = SimpleModel(hidden_dim)
 
+        dtype=torch.half
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                ds_config["fp16"]["enabled"] = False
+                ds_config["fp32"] = {"enabled" : True}
+                if get_hpu_dev_version() == "Gaudi":
+                    ds_config["communication_data_type"] = 'bfp16'
+                dtype=torch.float
+            hpu_flag, msg = is_hpu_supported(ds_config)
+            if not hpu_flag:
+                pytest.skip(msg)
         model, _, _, _ = deepspeed.initialize(config=ds_config,
                                             model=model,
                                             model_parameters=model.parameters())
         data_loader = random_dataloader(model=model,
                                         total_samples=8,
                                         hidden_dim=hidden_dim,
-                                        device=model.device)
+                                        device=model.device,
+                                        dtype=dtype)
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
             model.backward(loss)
@@ -264,13 +338,26 @@ class TestZeROElasticCheckpoint(DistributedTest):
         expected_mismatch_keys = [] if required_minimum_torch_version(1,
                                                                       4) else ['params']
         models = [SimpleModel(hidden_dim) for _ in range(2)]
+
+        dtype=torch.half
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                ds_config["fp16"]["enabled"] = False
+                ds_config["fp32"] = {"enabled" : True}
+                dtype=torch.float
+                if get_hpu_dev_version() == "Gaudi":
+                    ds_config["communication_data_type"] = 'bfp16'
+            hpu_flag, msg = is_hpu_supported(ds_config)
+            if not hpu_flag:
+                pytest.skip(msg)
         model, _, _, _ = deepspeed.initialize(config=ds_config,
                                             model=models[0],
                                             model_parameters=models[0].parameters())
         data_loader = random_dataloader(model=model,
                                         total_samples=8,
                                         hidden_dim=hidden_dim,
-                                        device=model.device)
+                                        device=model.device,
+                                        dtype=dtype)
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
             model.backward(loss)
@@ -298,7 +385,8 @@ class TestZeROElasticCheckpoint(DistributedTest):
         data_loader = random_dataloader(model=model,
                                         total_samples=8,
                                         hidden_dim=hidden_dim,
-                                        device=model.device)
+                                        device=model.device,
+                                        dtype=dtype)
         for n, batch in enumerate(data_loader):
             loss = model(batch[0], batch[1])
             model.backward(loss)
@@ -327,6 +415,16 @@ class TestZeROElasticCheckpoint(DistributedTest):
         hidden_dim = 10
         model = SimpleModel(hidden_dim)
 
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                ds_config["fp16"]["enabled"] = False
+                ds_config["fp32"] = {"enabled" : True}
+                if get_hpu_dev_version() == "Gaudi":
+                    ds_config["communication_data_type"] = 'bfp16'
+
+            hpu_flag, msg = is_hpu_supported(ds_config)
+            if not hpu_flag:
+                pytest.skip(msg)
         # Load checkpoint with dp world size = 2
         model, _, _, _ = deepspeed.initialize(config=ds_config,
                                                 model=model,
@@ -359,6 +457,15 @@ class TestZeROSaveLoadEdgeCase(DistributedTest):
         hidden_dim = 10
         model = SimpleModel(hidden_dim)
 
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                config_dict["fp16"]["enabled"] = False
+                config_dict["fp32"] = {"enabled" : True}
+                if get_hpu_dev_version() == "Gaudi":
+                    config_dict["communication_data_type"] = 'bfp16'
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
         ds_model = create_deepspeed_model(config_dict=config_dict,
                                           model=model,
                                           base_optimizer=None)
@@ -388,6 +495,16 @@ class TestZeROSaveLoadEdgeCase(DistributedTest):
 
         # 1. pretrain a model and save it
         dtype = torch.half
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                config_dict["fp16"]["enabled"] = False
+                config_dict["fp32"] = {"enabled" : True}
+                if zero_stage == 1:
+                    config_dict["communication_data_type"] = 'bfp16'
+                dtype = torch.float
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
         ds_model = create_deepspeed_model(config_dict=config_dict,
                                           model=model,
                                           base_optimizer=None)
@@ -433,6 +550,17 @@ class TestZeROSaveLoadEdgeCase(DistributedTest):
         hidden_dim = 10
         model = SimpleModel(hidden_dim)
 
+        dtype = torch.half
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                config_dict["fp16"]["enabled"] = False
+                config_dict["fp32"] = {"enabled" : True}
+                if get_hpu_dev_version() == "Gaudi":
+                    config_dict["communication_data_type"] = 'bfp16'
+                dtype = torch.float
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
         # This test reproduces a bug where one tries to retrieve a 16bit model before grad_accum
         # cycle was completed.
         # So we config grad_accum=2 and step only once and save_16bit_model
@@ -444,7 +572,7 @@ class TestZeROSaveLoadEdgeCase(DistributedTest):
                                         total_samples=2,
                                         hidden_dim=hidden_dim,
                                         device=ds_model.device,
-                                        dtype=torch.half)
+                                        dtype=dtype)
 
         batch = next(iter(data_loader))
         loss = ds_model(batch[0], batch[1])

@@ -62,13 +62,13 @@ from deepspeed.utils.timer import ThroughputTimer, SynchronizedWallClockTimer
 from deepspeed.utils.debug import debug_extract_module_and_param_names
 from deepspeed.monitor.monitor import MonitorMaster
 from deepspeed.runtime.progressive_layer_drop import ProgressiveLayerDrop
-from deepspeed.runtime.utils import clip_grad_norm_
+from deepspeed.runtime.utils import clip_grad_norm_, typeof
 from deepspeed.runtime.eigenvalue import Eigenvalue
 from deepspeed.runtime.data_pipeline.curriculum_scheduler import CurriculumScheduler
 from deepspeed.runtime.checkpoint_engine.torch_checkpoint_engine import TorchCheckpointEngine
 
 from .pipe.module import PipelineModule
-from .utils import ensure_directory_exists, get_ma_status
+from .utils import ensure_directory_exists, get_ma_status, get_use_hpu, torch_check_hpu_fp16_supported
 from ..ops.op_builder import UtilsBuilder
 from ..ops.adam import FusedAdam
 from ..moe.sharded_moe import TopKGate, MOELayer
@@ -102,19 +102,19 @@ except ImportError:
 
 def split_half_float_double_sparse(tensors):
     supported_types = [
-        "torch.cuda.HalfTensor",
-        "torch.cuda.FloatTensor",
-        "torch.cuda.DoubleTensor",
-        "torch.cuda.BFloat16Tensor",
+        torch.float16,
+        torch.float32,
+        torch.float64,
+        torch.bfloat16,
         SparseTensor.type()
     ]
 
     for t in tensors:
-        assert t.type() in supported_types, f"attempting to reduce an unsupported grad type: {t.type()}"
+        assert typeof(t) in supported_types, f"attempting to reduce an unsupported grad type: {typeof(t)}"
 
     buckets = []
     for i, dtype in enumerate(supported_types):
-        bucket = [t for t in tensors if t.type() == dtype]
+        bucket = [t for t in tensors if typeof(t) == dtype]
         if bucket:
             buckets.append((dtype, bucket))
     return buckets
@@ -218,7 +218,14 @@ class DeepSpeedEngine(Module):
         self.eigenvalue = None
         self.block_eigenvalue = None
         self.gas_boundary_ctr = 0
-        self.dist_backend = "nccl"
+        self.use_hpu = get_use_hpu()
+        if self.use_hpu:
+            self.no_cuda = True
+            self.fp16_supported = torch_check_hpu_fp16_supported()
+        else:
+            self.no_cuda = getattr(args, 'no_cuda', False) if args else False
+            self.fp16_supported = True
+        self.dist_backend = "hccl" if self.use_hpu else "nccl" if not self.no_cuda else "gloo"
         self.has_moe_layers = False
         self.num_experts = []
         self.gate_modules = []
@@ -236,9 +243,6 @@ class DeepSpeedEngine(Module):
 
         # for debug purposes - can then debug print: debug_get_module_name(module)
         debug_extract_module_and_param_names(model)
-
-        # needed for zero_to_fp32 weights reconstruction to remap nameless data to state_dict
-        self.param_names = {param: name for name, param in model.named_parameters()}
 
         # Set config using config_params for backwards compat
         if self.config is None and config_params is not None:
@@ -266,6 +270,21 @@ class DeepSpeedEngine(Module):
         self._do_sanity_check()
         see_memory_usage(f"DeepSpeed Engine: After args sanity test",
                          force=self.memory_breakdown())
+
+        if self.fp16_enabled() and not self.fp16_supported:
+            raise ValueError("Type fp16 is not supported.")
+
+        if self.fp16_enabled():
+            self.dtype_str = "fp16"
+        elif self.bfloat16_enabled():
+            self.dtype_str = "bf16"
+        else:
+            self.dtype_str = "fp32"
+
+        if dist.get_world_size() == 1 and not self.zero_optimization():
+            # adds overhead to the iteration time
+            self.enable_backward_allreduce = False
+
         if mpu is not None:
             if self.elasticity_enabled():
                 if not self.is_elastic_model_parallel_supported():
@@ -289,18 +308,49 @@ class DeepSpeedEngine(Module):
         # Configure distributed model
         self._configure_distributed_model(model)
 
+        # needed for zero_to_fp32 weights reconstruction to remap nameless data to state_dict
+        self.param_names = {param: name for name, param in model.named_parameters()}
+
         self._get_model_parameters()
 
         see_memory_usage(f"DeepSpeed Engine: After configure distributed model")
 
         # Configure wall clock timers
-        self.timers = SynchronizedWallClockTimer()
+        self.timers = SynchronizedWallClockTimer(use_hpu=self.use_hpu)
         # Throughput timer
+        if self.use_hpu or self.no_cuda:
+            synchronize_fn = None
+        else:
+            synchronize_fn = torch.cuda.synchronize
+
+        class MemInfo:
+            peak_ = 0
+
+            @classmethod
+            def get(cls):
+                if self.use_hpu:
+                    from habana_frameworks.torch.hpu import memory
+                    used = memory.memory_allocated()
+                    peak = memory.max_memory_allocated()
+                elif self.no_cuda:
+                    import os, psutil
+                    process = psutil.Process(os.getpid())
+                    used = process.memory_info().rss
+                    if used > cls.peak_:
+                        cls.peak_ = used
+                    peak = cls.peak_
+                else:
+                    used = torch.cuda.memory_allocated()
+                    peak = torch.cuda.max_memory_allocated()
+                return (used, peak)
+
         self.tput_timer = ThroughputTimer(
             batch_size=self.train_micro_batch_size_per_gpu(),
             num_workers=self.dp_world_size,
             steps_per_output=self.steps_per_print(),
             monitor_memory=False,
+            synchronize_fn=synchronize_fn,
+            mem_stats_fn=MemInfo.get
         )
 
         log_dist(f"DeepSpeed Flops Profiler Enabled: {self.flops_profiler_enabled()}",
@@ -642,6 +692,9 @@ class DeepSpeedEngine(Module):
     def zero_allow_untested_optimizer(self):
         return self._config.zero_allow_untested_optimizer
 
+    def zero_allow_comm_data_type_fp32(self):
+        return self._config.zero_allow_comm_data_type_fp32
+
     def zero_reduce_scatter(self):
         return self._config.zero_config.reduce_scatter
 
@@ -675,6 +728,10 @@ class DeepSpeedEngine(Module):
 
     def zero_reduce_bucket_size(self):
         return self._config.zero_config.reduce_bucket_size
+
+    # TODO SW-97921: remove this WA code when SW-97305 is resolved
+    def max_group_size(self):
+        return self._config.zero_config.max_group_size
 
     def zero_allgather_bucket_size(self):
         return self._config.zero_config.allgather_bucket_size
@@ -756,10 +813,12 @@ class DeepSpeedEngine(Module):
         res = self._config.communication_data_type
         if res is not None:
             return res
-        elif self.fp16_enabled() or self.zero_optimization_stage():
+        elif self.fp16_enabled():
             return torch.float16
         elif self.bfloat16_enabled():
             return torch.bfloat16
+        elif self.zero_optimization_stage():
+            return torch.float16
 
         return torch.float32
 
@@ -892,14 +951,24 @@ class DeepSpeedEngine(Module):
             args,
             'device_rank') else self.local_rank
         if device_rank >= 0:
-            torch.cuda.set_device(device_rank)
-            self.device = torch.device("cuda", device_rank)
+            if self.use_hpu:
+                self.device = torch.device("hpu")
+            elif self.no_cuda:
+                self.device = torch.device("cpu")
+            else:
+                torch.cuda.set_device(device_rank)
+                self.device = torch.device("cuda", device_rank)
             self.world_size = dist.get_world_size()
             self.global_rank = dist.get_rank()
         else:
             self.world_size = 1
             self.global_rank = 0
-            self.device = torch.device("cuda")
+            if self.use_hpu:
+                self.device = torch.device("hpu")
+            elif self.no_cuda:
+                self.device = torch.device("cpu")
+            else:
+                self.device = torch.device("cuda")
 
     # Configure based on command line arguments
     def _configure_with_arguments(self, args, mpu):
@@ -1161,9 +1230,9 @@ class DeepSpeedEngine(Module):
         # data type checks
         elif model_dtype == grad_accum_dtype:
             if model_dtype == torch.bfloat16:
-                raise NotImplementedError(
-                    "Bfloat16 wrapper must use a gradient accumulation type of fp32, enable ZeRO to use Bfloat16 gradient accumulation"
-                )
+                logger.warning("Bfloat16 wrapper must use a gradient accumulation type of fp32, enable ZeRO to use Bfloat16 gradient accumulation")
+                logger.warning("BF16 gradient accumulation is not safe numerically with large number of accumulation steps")
+                return BFLOAT16
             if model_dtype == torch.float16:
                 return FP16
             # else optimizer_wrapper = None
@@ -1224,7 +1293,7 @@ class DeepSpeedEngine(Module):
         else:
             self.optimizer = basic_optimizer
 
-        log_dist("DeepSpeed Final Optimizer = {}".format(self.optimizer_name()),
+        log_dist("DeepSpeed Final Optimizer = {}".format(self.optimizer.__class__.__name__),
                  ranks=[0])
 
         self.compression_scheduler = self._configure_compression_scheduler()
@@ -1266,9 +1335,15 @@ class DeepSpeedEngine(Module):
                         optimizer = DeepSpeedCPUAdam(model_parameters,
                                                      **optimizer_parameters,
                                                      adamw_mode=effective_adam_w_mode)
+                elif self.use_hpu:
+                    if effective_adam_w_mode:
+                        from habana_frameworks.torch.hpex.optimizers import FusedAdamW
+                        optimizer = FusedAdamW(model_parameters, **optimizer_parameters)
+                    else:
+                        optimizer = torch.optim.Adam(model_parameters,
+                                                     **optimizer_parameters)
                 else:
                     from deepspeed.ops.adam import FusedAdam
-
                     optimizer = FusedAdam(
                         model_parameters,
                         **optimizer_parameters,
@@ -1396,6 +1471,7 @@ class DeepSpeedEngine(Module):
                 mpu=self.mpu,
                 clip_grad=clip_grad,
                 fused_lamb_legacy=self.optimizer_name() == LAMB_OPTIMIZER,
+                use_hpu=self.use_hpu,
             )
 
         return optimizer
@@ -1416,13 +1492,24 @@ class DeepSpeedEngine(Module):
             clip_grad=clip_grad,
             allgather_bucket_size=self.zero_allgather_bucket_size(),
             dp_process_group=self.data_parallel_group,
-            timers=timers)
+            timers=timers,
+            # TODO SW-97921: remove this WA code when SW-97305 is resolved
+            max_group_size=self.max_group_size(),
+            grad_acc_dtype=self.get_data_types()[1])
 
         return optimizer
 
     def _configure_zero_optimizer(self, optimizer):
         zero_stage = self.zero_optimization_stage()
-        assert self.communication_data_type in (torch.float16, torch.bfloat16), "ZeRO supports only 'communication_data_type': ['fp16', 'bfp16']"
+
+        log_dist('Creating {} ZeRO stage {} optimizer'.format(self.dtype_str, zero_stage), ranks=[0])
+
+        if self.zero_allow_comm_data_type_fp32() and self.communication_data_type == torch.float32:
+            log_dist('Using ZeRO with comm data type fp32', ranks=[0])
+        else:
+            assert self.communication_data_type in (torch.float16, torch.bfloat16), \
+                "ZeRO supports only 'communication_data_type': ['fp16', 'bfp16']"
+
         timers = self.timers if self.wall_clock_breakdown() else None
 
         if optimizer is None:
@@ -1439,12 +1526,15 @@ class DeepSpeedEngine(Module):
             round_robin_gradients = self.zero_round_robin_gradients()
             assert not isinstance(optimizer, DummyOptim), "zero stage {} requires an optimizer".format(zero_stage)
 
-            log_dist('Creating fp16 ZeRO stage {} optimizer'.format(zero_stage),
+            log_dist('Creating {} ZeRO stage {} optimizer'.format(self.dtype_str, zero_stage),
                      ranks=[0])
             # Overlap and contiguous grads are meaningless in stage 1 and are ignored
             if zero_stage == ZeroStageEnum.optimizer_states:
                 overlap_comm = False
                 round_robin_gradients = False
+                # Non-MoE requires contiguous grads to be disabled w. stage 1
+                if not self.has_moe_layers:
+                    contiguous_gradients = False
 
             if isinstance(self.module, PipelineModule):
                 if overlap_comm:
@@ -1462,6 +1552,8 @@ class DeepSpeedEngine(Module):
                 clip_grad=self.gradient_clipping(),
                 contiguous_gradients=contiguous_gradients,
                 reduce_bucket_size=self.zero_reduce_bucket_size(),
+                # TODO SW-97921: remove this WA code when SW-97305 is resolved
+                max_group_size=self.max_group_size(),
                 allgather_bucket_size=self.zero_allgather_bucket_size(),
                 dp_process_group=self.data_parallel_group,
                 expert_parallel_group=self.expert_parallel_group
@@ -1482,7 +1574,9 @@ class DeepSpeedEngine(Module):
                 fp16_master_weights_and_gradients=self.fp16_master_weights_and_gradients(
                 ),
                 communication_data_type=self.communication_data_type,
-                elastic_checkpoint=self.zero_elastic_checkpoint())
+                elastic_checkpoint=self.zero_elastic_checkpoint(),
+                use_hpu=self.use_hpu,
+                no_cuda=self.no_cuda)
 
         elif zero_stage == ZeroStageEnum.weights:
             assert not self.has_moe_layers, "MoE not supported with Stage 3"
@@ -1499,9 +1593,11 @@ class DeepSpeedEngine(Module):
                     param_persistence_threshold=self.zero_param_persistence_threshold(),
                     model_persistence_threshold=self.zero_model_persistence_threshold(),
                     offload_param_config=self.zero_offload_param(),
-                    mpu=self.mpu)
+                    mpu=self.mpu,
+                    use_hpu=self.use_hpu,
+                    no_cuda=self.no_cuda)
             else:
-                log_dist('Creating fp16 ZeRO stage {} optimizer'.format(zero_stage),
+                log_dist('Creating {} ZeRO stage {} optimizer'.format(self.dtype_str, zero_stage),
                          ranks=[0])
                 from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
                 optimizer = DeepSpeedZeroOptimizer_Stage3(
@@ -1531,7 +1627,9 @@ class DeepSpeedEngine(Module):
                     gradient_predivide_factor=self.gradient_predivide_factor(),
                     gradient_accumulation_steps=self.gradient_accumulation_steps(),
                     aio_config=self.aio_config(),
-                    communication_data_type=self.communication_data_type)
+                    communication_data_type=self.communication_data_type,
+                    use_hpu=self.use_hpu,
+                    no_cuda=self.no_cuda)
 
         else:
             raise NotImplementedError("ZeRO stage {} not implemented".format(zero_stage))
@@ -1640,14 +1738,15 @@ class DeepSpeedEngine(Module):
         self.warn_unscaled_loss = True
         self.module.train(False)
 
-    def _scale_loss_by_gas(self, prescaled_loss):
+    def _scale_loss_by_gas(self, prescaled_loss, eval_micro_batches=None):
+        gas = self.gradient_accumulation_steps() if eval_micro_batches is None else eval_micro_batches
         if isinstance(prescaled_loss, torch.Tensor):
-            scaled_loss = prescaled_loss / self.gradient_accumulation_steps()
+            scaled_loss = prescaled_loss / gas
         elif isinstance(prescaled_loss, tuple) or isinstance(prescaled_loss, list):
             scaled_loss = []
             for l in prescaled_loss:
                 if isinstance(l, torch.Tensor):
-                    scaled_loss.append(l / self.gradient_accumulation_steps())
+                    scaled_loss.append(l / gas)
                 else:
                     scaled_loss.append(l)
         else:
@@ -2500,6 +2599,7 @@ class DeepSpeedEngine(Module):
                         state_dict.update(expert_state_dict)
                     moe_layer_id += 1
 
+
     def load_module_state_dict(self, state_dict, strict=True, custom_load_fn=None):
         if custom_load_fn:
             custom_load_fn(src=state_dict, dst=self.module)
@@ -2680,7 +2780,7 @@ class DeepSpeedEngine(Module):
         ckpt_list = self._get_all_ckpt_names(load_dir, tag)
         sd_loader = SDLoaderFactory.get_sd_loader(
             ckpt_list,
-            checkpoint_engine=self.checkpoint_engine)
+            checkpoint_engine=self.checkpoint_engine, device=self.device)
 
         is_pipe_parallel = isinstance(self.module, PipelineModule)
 
@@ -2697,7 +2797,6 @@ class DeepSpeedEngine(Module):
             self._curr_ckpt_path = os.path.join(load_dir, tag)
 
         if self.has_moe_layers:
-            # print(checkpoint.keys())
             old_moe_load = False
             if not isinstance(checkpoint['num_experts'], list):
                 old_moe_load = True
@@ -2733,13 +2832,21 @@ class DeepSpeedEngine(Module):
 
             has_zero_optimizer_state = self.zero_optimization() or self.bfloat16_enabled(
             )
-            if load_optimizer_states and self.optimizer is not None and not has_zero_optimizer_state:
-                if self.fp16_enabled():
-                    self.optimizer.load_state_dict(
-                        optim_checkpoint['optimizer'],
-                        load_optimizer_states=load_optimizer_states)
+            if load_optimizer_states and self.optimizer is not None:
+                if has_zero_optimizer_state:
+                    # currently universal checkpoint does not have base_optimizer_state
+                    # when we load from universal, we lose the "step" information.
+                    # as a workaround, update the step from global_step information.
+                    # TODO: add base optimizer state in universal checkpoint
+                    if self.load_universal_checkpoint() and self.bfloat16_enabled():
+                        self.optimizer.update_steps(checkpoint['global_steps'])
                 else:
-                    self.optimizer.load_state_dict(optim_checkpoint['optimizer'])
+                    if self.fp16_enabled():
+                        self.optimizer.load_state_dict(
+                            optim_checkpoint['optimizer'],
+                            load_optimizer_states=load_optimizer_states)
+                    else:
+                        self.optimizer.load_state_dict(optim_checkpoint['optimizer'])
 
             if load_lr_scheduler_states and self.lr_scheduler is not None:
                 self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
@@ -2961,7 +3068,8 @@ class DeepSpeedEngine(Module):
         # There seems to be issue creating them in parallel
 
         # Ensure save_dir directory exists
-        os.makedirs(save_dir, exist_ok=True)
+        if self.global_rank == 0:
+            os.makedirs(save_dir, exist_ok=True)
         dist.barrier()
 
         if tag is None:
@@ -3182,6 +3290,7 @@ class DeepSpeedEngine(Module):
         if self.save_non_zero_checkpoint:
             log_dist(message=f'Saving model checkpoint: {save_path}', ranks=[0, 1])
             self.checkpoint_engine.save(state, save_path)
+            self._curr_save_path = None
 
     def _get_buffer_names(self):
         buffer_names = []
@@ -3261,6 +3370,8 @@ class DeepSpeedEngine(Module):
         zero_sd = dict(optimizer_state_dict=self.optimizer.state_dict(),
                        ds_config=self.config,
                        ds_version=version)
+
+        # TODO: check if checkpoint_engine.save is good for HPU
         self.checkpoint_engine.save(zero_sd, zero_checkpoint_name)
 
         if self.global_rank == 0:

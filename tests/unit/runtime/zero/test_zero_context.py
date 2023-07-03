@@ -9,6 +9,7 @@ from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus, partiti
 import deepspeed.comm as dist
 
 from unit.common import DistributedTest, get_master_port
+from unit.hpu import *
 
 
 def setup_serial_env():
@@ -18,12 +19,20 @@ def setup_serial_env():
     os.environ['LOCAL_RANK'] = '0'
     os.environ['RANK'] = '0'
     os.environ['WORLD_SIZE'] = '1'
+    if bool(pytest.use_hpu) == True:
+        import habana_frameworks.torch.hpu
 
 
 def test_scattered_init_dist():
     setup_serial_env()
     assert not dist.is_initialized()
-    with deepspeed.zero.Init():
+    use_hpu = None
+    zero3_init_dtype=None
+    if bool(pytest.use_hpu) == True:
+        use_hpu = True
+        if os.getenv("REPLACE_FP16", default=None):
+            zero3_init_dtype=torch.bfloat16
+    with deepspeed.zero.Init(use_hpu=use_hpu,dtype=zero3_init_dtype):
         assert dist.is_initialized()
 
 
@@ -31,7 +40,13 @@ class TestScatterGather(DistributedTest):
     world_size = 2
 
     def test(self):
-        with deepspeed.zero.Init():
+        use_hpu = None
+        zero3_init_dtype=None
+        if bool(pytest.use_hpu) == True:
+            use_hpu = True
+            if os.getenv("REPLACE_FP16", default=None):
+                zero3_init_dtype=torch.bfloat16
+        with deepspeed.zero.Init(use_hpu=use_hpu,dtype=zero3_init_dtype):
             l = torch.nn.Linear(6, 3)
         assert l.weight.ds_status == ZeroParamStatus.NOT_AVAILABLE
         assert l.weight.shape == torch.Size(partitioned_param_data_shape)
@@ -50,7 +65,13 @@ class TestGatherUpdate(DistributedTest):
     world_size = 2
 
     def test(self):
-        with deepspeed.zero.Init():
+        use_hpu = None
+        zero3_init_dtype=None
+        if bool(pytest.use_hpu) == True:
+            use_hpu = True
+            if os.getenv("REPLACE_FP16", default=None):
+                zero3_init_dtype=torch.bfloat16
+        with deepspeed.zero.Init(use_hpu=use_hpu, dtype=zero3_init_dtype):
             l = torch.nn.Linear(4, 2)
         assert l.weight.ds_status == ZeroParamStatus.NOT_AVAILABLE
 
@@ -108,8 +129,17 @@ def test_ext_param_getattr():
             return C.sum()
 
     net = ExtLinear()
-
+    dtype = torch.float16
+    if bool(pytest.use_hpu) == True:
+        if os.getenv("REPLACE_FP16", default=None):
+            config["fp16"]["enabled"] = False
+            config["bf16"] = {"enabled" : True}
+            dtype = torch.bfloat16
+        hpu_flag, msg = is_hpu_supported(config)
+        if not hpu_flag:
+            pytest.skip(msg)
     args = SimpleNamespace(local_rank=0)
+
     engine, optim, _, _ = deepspeed.initialize(args=args,
                                                model=net,
                                                model_parameters=net.parameters(),
@@ -118,7 +148,7 @@ def test_ext_param_getattr():
     with deepspeed.zero.GatheredParameters(net.linear1.weight):
         assert net.linear1.weight.numel() == net.dim**2
 
-    input = torch.rand(net.dim).to(engine.device).half()
+    input = torch.rand(net.dim).to(engine.device, dtype=dtype)
     loss = engine(input)
     engine.backward(loss)
     engine.step()
@@ -126,8 +156,12 @@ def test_ext_param_getattr():
 
 def test_scatter_halftype():
     setup_serial_env()
-
-    with deepspeed.zero.Init():
+    use_hpu = None
+    if bool(pytest.use_hpu) == True:
+        if get_hpu_dev_version() == 'Gaudi':
+            pytest.skip("FP16 is not supported by Gaudi.")
+        use_hpu = True
+    with deepspeed.zero.Init(use_hpu = use_hpu):
         l = torch.nn.Linear(10, 10)
         assert l.weight.ds_tensor.dtype == torch.float16
 
@@ -213,6 +247,15 @@ def test_ext_param_return():
     setup_serial_env()
 
     net = DanglingExt()
+    dtype = torch.float16
+    if bool(pytest.use_hpu) == True:
+        if os.getenv("REPLACE_FP16", default=None):
+            config["fp16"]["enabled"] = False
+            config["bf16"] = {"enabled" : True}
+            dtype = torch.bfloat16
+        hpu_flag, msg = is_hpu_supported(config)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     args = SimpleNamespace(local_rank=0)
     engine, optim, _, _ = deepspeed.initialize(args=args,
@@ -221,18 +264,27 @@ def test_ext_param_return():
                                                config=config)
 
     for _ in range(5):
-        input = torch.rand(net.dim).to(engine.device).half()
+        input = torch.rand(net.dim).to(engine.device, dtype=dtype)
         loss = engine(input)
         engine.backward(loss)
         engine.step()
 
 
-@pytest.mark.skip('WIP')
+@pytest.mark.skip(reason='WIP')
 def test_ext_param_returnobj():
     setup_serial_env()
     print()
 
     net = ModelContainer(return_obj=True)
+    dtype = torch.float16
+    if bool(pytest.use_hpu) == True:
+        if os.getenv("REPLACE_FP16", default=None):
+            config["fp16"]["enabled"] = False
+            config["bf16"] = {"enabled" : True}
+            dtype = torch.bfloat16
+        hpu_flag, msg = is_hpu_supported(config)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     args = SimpleNamespace(local_rank=0)
     engine, optim, _, _ = deepspeed.initialize(args=args,
@@ -241,7 +293,7 @@ def test_ext_param_returnobj():
                                                config=config)
 
     for _ in range(5):
-        input = torch.rand(net.dim).to(engine.device).half()
+        input = torch.rand(net.dim).to(engine.device, dtype=dtype)
         loss = engine(input)
         assert len(net._external_params) == 1
         assert len(net.dangler._external_params) == 0
@@ -270,6 +322,15 @@ def test_stage_3_output_type(output_type):
     print()
 
     net = ModelContainerVariableOutputType(output_type=output_type)
+    dtype = torch.float16
+    if bool(pytest.use_hpu) == True:
+        if os.getenv("REPLACE_FP16", default=None):
+            config["fp16"]["enabled"] = False
+            config["bf16"] = {"enabled" : True}
+            dtype = torch.bfloat16
+        hpu_flag, msg = is_hpu_supported(config)
+        if not hpu_flag:
+            pytest.skip(msg)
 
     args = SimpleNamespace(local_rank=0)
     engine, optim, _, _ = deepspeed.initialize(args=args,
@@ -278,7 +339,7 @@ def test_stage_3_output_type(output_type):
                                                config=config)
 
     for _ in range(1):
-        input = torch.rand(net.dim).to(engine.device).half()
+        input = torch.rand(net.dim).to(engine.device, dtype=dtype)
         loss = engine(input)
         if loss is not None:
             if isinstance(loss, dict):
@@ -308,8 +369,17 @@ class ConvNet(torch.nn.Module):
         return x
 
 
+@pytest.mark.xfail(bool(pytest.use_hpu) == True, reason="xfail, due to SW-101073")
 def test_subclass_param():
     setup_serial_env()
+    if bool(pytest.use_hpu) == True:
+        if os.getenv("REPLACE_FP16", default=None):
+            config["fp16"]["enabled"] = False
+            config["bf16"] = {"enabled" : True}
+        hpu_flag, msg = is_hpu_supported(config)
+        if not hpu_flag:
+            pytest.skip(msg)
+
     with deepspeed.zero.Init(config=config):
         model = ConvNet()
 
@@ -350,6 +420,19 @@ class Son(Pa):
 
 def test_subclass_param_init():
     setup_serial_env()
+
+    dtype = torch.float16
+    dev = "cuda"
+    if bool(pytest.use_hpu) == True:
+        dev = "hpu"
+        if os.getenv("REPLACE_FP16", default=None):
+            config["fp16"]["enabled"] = False
+            config["bf16"] = {"enabled" : True}
+            dtype = torch.bfloat16
+        hpu_flag, msg = is_hpu_supported(config)
+        if not hpu_flag:
+            pytest.skip(msg)
+
     with deepspeed.zero.Init(config=config):
         model = Son().cpu()
 
@@ -359,7 +442,7 @@ def test_subclass_param_init():
     assert model.param.ds_status == ZeroParamStatus.NOT_AVAILABLE
 
     # test that the weights manipulation during each __init__ worked in all w/o needing gathering
-    ones = torch.ones(5).half().cuda()
+    ones = torch.ones(5).to(torch.device(dev), dtype=dtype)
     with deepspeed.zero.GatheredParameters(list(model.parameters(recurse=False))):
         assert torch.equal(model.param, ones + 1)
         assert torch.equal(model.param_pa, ones + 2)
@@ -388,8 +471,13 @@ class TestDSInitWZinit(DistributedTest):
 
             def magic(self):
                 return 42
-
-        with deepspeed.zero.Init():
+        use_hpu = None
+        zero3_init_dtype=None
+        if bool(pytest.use_hpu) == True:
+            use_hpu = True
+            if os.getenv("REPLACE_FP16", default=None):
+                zero3_init_dtype=torch.bfloat16
+        with deepspeed.zero.Init(use_hpu=use_hpu, dtype=zero3_init_dtype):
             model = Model()
             engine, *_ = deepspeed.initialize(model=model, config=ds_config, model_parameters=model.parameters())
         assert engine.magic() == 42

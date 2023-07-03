@@ -6,6 +6,10 @@ import pytest
 import torch
 from deepspeed.ops import op_builder
 
+pytestmark = pytest.mark.skipif(
+    ((bool(pytest.use_hpu) == True)),
+    reason="Quantize kernel not supported by HPU.")
+
 inference_module = None
 
 

@@ -4,6 +4,7 @@ from unit.common import DistributedTest
 from deepspeed.git_version_info import version as ds_version
 import os
 from unit.simple_model import SimpleModel
+from unit.hpu import *
 
 
 @pytest.fixture
@@ -62,9 +63,9 @@ def test_disabled(ds_config):
 
 def test_valid_world_size(ds_config):
     final_batch_size, valid_gpus, mbsize = deepspeed.elasticity.compute_elastic_config(
-            ds_config=ds_config,
-            target_deepspeed_version=ds_version,
-            world_size=64)
+        ds_config=ds_config,
+        target_deepspeed_version=ds_version,
+        world_size=64)
     assert mbsize == 17
 
 
@@ -203,13 +204,17 @@ class TestNonElasticBatchParams(DistributedTest):
             }
         }
         hidden_dim = 10
+        if bool(pytest.use_hpu) == True:
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
 
         model = SimpleModel(hidden_dim, empty_grad=False)
 
         with pytest.raises(deepspeed.elasticity.config.ElasticityError):
-            model, _, _,_ = deepspeed.initialize(config=config_dict,
-                                                 model=model,
-                                                 model_parameters=model.parameters())
+            model, _, _, _ = deepspeed.initialize(config=config_dict,
+                                                  model=model,
+                                                  model_parameters=model.parameters())
 
 
 class TestNonElasticBatchParamsWithOverride(DistributedTest):
@@ -241,11 +246,15 @@ class TestNonElasticBatchParamsWithOverride(DistributedTest):
             }
         }
         hidden_dim = 10
+        if bool(pytest.use_hpu) == True:
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
 
         model = SimpleModel(hidden_dim, empty_grad=False)
-        model, _, _,_ = deepspeed.initialize(config=config_dict,
-                                             model=model,
-                                             model_parameters=model.parameters())
+        model, _, _, _ = deepspeed.initialize(config=config_dict,
+                                              model=model,
+                                              model_parameters=model.parameters())
 
 
 class TestElasticConfigChanged(DistributedTest):
@@ -276,15 +285,21 @@ class TestElasticConfigChanged(DistributedTest):
                 "ignore_non_elastic_batch_info": True
             }
         }
-        import json, os
+        import json
+        import os
         scheduler_elastic_config = config_dict.copy()
         scheduler_elastic_config["elasticity"]["max_train_batch_size"] = 27
-        os.environ['DEEPSPEED_ELASTICITY_CONFIG'] = json.dumps(scheduler_elastic_config)
+        os.environ['DEEPSPEED_ELASTICITY_CONFIG'] = json.dumps(
+            scheduler_elastic_config)
         hidden_dim = 10
+        if bool(pytest.use_hpu) == True:
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
 
         model = SimpleModel(hidden_dim, empty_grad=False)
 
         with pytest.raises(deepspeed.elasticity.config.ElasticityError):
-            model, _, _,_ = deepspeed.initialize(config=config_dict,
-                                                 model=model,
-                                                 model_parameters=model.parameters())
+            model, _, _, _ = deepspeed.initialize(config=config_dict,
+                                                  model=model,
+                                                  model_parameters=model.parameters())

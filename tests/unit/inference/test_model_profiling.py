@@ -5,6 +5,7 @@ import torch
 import deepspeed
 from transformers import pipeline
 from unit.common import DistributedTest
+from unit.hpu import *
 
 
 @pytest.fixture
@@ -58,11 +59,33 @@ class TestModelProfiling(DistributedTest):
         if cuda_graphs and "bert" not in model:
             pytest.skip(f"CUDA Graph not supported for {model}")
 
+        if bool(pytest.use_hpu) == True:
+            # FP16 is not supported on Gaudi1.
+            if get_hpu_dev_version() == "Gaudi":
+                pytest.skip(f"FP16 tests are not supported by Gaudi1.")
+
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
         world_size = int(os.getenv("WORLD_SIZE", "1"))
-
-        pipe = pipeline(task, model, framework="pt", device=local_rank)
-        pipe.model = deepspeed.init_inference(pipe.model,
+        if bool(pytest.use_hpu) == True:
+            dev_name = f"hpu:{local_rank}"
+            pipe = pipeline(task, model, framework="pt", device=dev_name)
+            device = torch.device(f"hpu:{local_rank}")
+            pipe.device = device
+            pipe.model.to(device)
+        else:
+            pipe = pipeline(task, model, framework="pt", device=local_rank)
+        if bool(pytest.use_hpu) == True:
+            import deepspeed.module_inject as module_inject
+            import habana_frameworks.torch as htorch
+            pipe.model = deepspeed.init_inference(pipe.model,
+                                              dtype=dtype,
+                                              mp_size=world_size,
+                                              replace_with_kernel_inject=False,
+                                              replace_method="auto",
+                                              injection_policy={"BertLayer": (module_inject.HFBertLayerPolicy,)},
+                                              enable_cuda_graph=cuda_graphs)
+        else:
+            pipe.model = deepspeed.init_inference(pipe.model,
                                               dtype=dtype,
                                               mp_size=world_size,
                                               replace_with_kernel_inject=True,
@@ -73,12 +96,18 @@ class TestModelProfiling(DistributedTest):
         e2e_times = []
         model_times = []
         for _ in range(10):
-            torch.cuda.synchronize()
+            if bool(pytest.use_hpu) == True:
+                htorch.hpu.synchronize()
+            else:
+                torch.cuda.synchronize()
             start = time.perf_counter_ns()
 
             r = pipe(query, **inf_kwargs)
 
-            torch.cuda.synchronize()
+            if bool(pytest.use_hpu) == True:
+                htorch.hpu.synchronize()
+            else:
+                torch.cuda.synchronize()
             end = time.perf_counter_ns()
 
             e2e_times.append((end - start) / 1e6)  # convert ns to ms

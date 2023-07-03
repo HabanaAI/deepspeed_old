@@ -3,13 +3,22 @@
 #define NOMINMAX  // Windows idiosyncrasy
                   // https://stackoverflow.com/questions/4913922/possible-problems-with-nominmax-on-visual-c
 
-#include <cuda_fp16.h>
-#include <cuda_runtime_api.h>
 #include <stdio.h>
 #include <cassert>
-#include "cuda.h"
-#include "custom_cuda_layers.h"
+#if not defined (USE_HPU)
+    #include <cuda_fp16.h>
+    #include <cuda_runtime_api.h>
+    #include "cuda.h"
+    #include "custom_cuda_layers.h"
+#else
+    #include <cmath>
+    #include <torch/torch.h>
+#endif
 #include "simd.h"
+#if defined (USE_HPU)
+    #define __half at::BFloat16
+#endif
+#include <unistd.h>
 
 #define STEP(SPAN)                                \
     void Step_##SPAN(float* _params,              \
@@ -39,16 +48,20 @@ public:
           _buf_index(false),
           _adamw_mode(adamw_mode)
     {
+#if not defined (USE_HPU)
         cudaMallocHost((void**)_doubled_buffer, TILE * sizeof(float));
         cudaMallocHost((void**)(_doubled_buffer + 1), TILE * sizeof(float));
 
         _streams[0] = Context::Instance().GetCurrentStream();
         _streams[1] = Context::Instance().GetNewStream();
+#endif
     }
     ~Adam_Optimizer()
     {
+#if not defined (USE_HPU)
         cudaFreeHost(_doubled_buffer[0]);
         cudaFreeHost(_doubled_buffer[1]);
+#endif
     }
 #if defined(__AVX512__) or defined(__AVX256__)
     template <int span>
@@ -64,10 +77,12 @@ public:
     STEP(1)
     STEP(4)
     STEP(8)
+#if not defined (USE_HPU)
     inline void SynchronizeStreams()
     {
         for (int i = 0; i < 2; i++) cudaStreamSynchronize(_streams[i]);
     }
+#endif
     inline void IncrementStep(size_t step, float beta1, float beta2)
     {
         if (beta1 != _betta1 || beta2 != _betta2) {
@@ -116,11 +131,15 @@ private:
     float _bias_correction1;
     float _bias_correction2;
 
+#if not defined (USE_HPU)
     float* _doubled_buffer[2];
+#endif
     bool _buf_index;
     bool _adamw_mode;
 
+#if not defined (USE_HPU)
     cudaStream_t _streams[2];
+#endif
 };
 
 #if defined(__AVX512__) or defined(__AVX256__)
@@ -168,7 +187,9 @@ void Adam_Optimizer::Step_AVX(size_t* rounded_size,
         size_t copy_size = TILE;
         if ((t + TILE) > new_rounded_size) copy_size = new_rounded_size - t;
         size_t offset = copy_size + t;
+#if not defined(USE_HPU)
         if ((t / TILE) >= 2) { cudaStreamSynchronize(_streams[_buf_index]); }
+#endif
 #pragma omp parallel for
         for (size_t i = t; i < offset; i += SIMD_WIDTH * span) {
             AVX_Data grad_4[span];
@@ -203,13 +224,18 @@ void Adam_Optimizer::Step_AVX(size_t* rounded_size,
             simd_fma<span>(param_4, grad_4, step_size_4, param_4);
 
             simd_store<span>(_params + (i >> rshft), param_4, half_precision);
+// _doubled_buffer needed to update params only in case of float16, which is currently not supported on HPU
+#if not defined(USE_HPU)
             if (dev_params) {
                 simd_store<span>(_doubled_buffer[_buf_index] + (i - t), param_4, half_precision);
             }
+#endif
             simd_store<span>(_exp_avg + i, momentum_4, false);
             simd_store<span>(_exp_avg_sq + i, variance_4, false);
         }
 
+// Params are updated only in case of float16, which is currently not supported on HPU
+#if not defined(USE_HPU)
         if (dev_params) {
             if (half_precision)
                 launch_param_update_half(
@@ -220,6 +246,7 @@ void Adam_Optimizer::Step_AVX(size_t* rounded_size,
 
             _buf_index = !_buf_index;
         }
+#endif
     }
     *rounded_size = new_rounded_size;
 }

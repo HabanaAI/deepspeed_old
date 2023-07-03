@@ -17,7 +17,7 @@ from deepspeed.utils import instrument_w_nvtx
 def _torch_reduce_scatter_fn(input_tensor: Tensor,
                              output_tensor: Tensor,
                              group=None,
-                             async_op=False,
+                             async_op=None,
                              prof=False):
     return instrument_w_nvtx(dist.reduce_scatter_fn)(output_tensor,
                                                      input_tensor,

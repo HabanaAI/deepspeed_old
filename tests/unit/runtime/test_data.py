@@ -35,7 +35,6 @@ class TestDataLoaderDropLast(DistributedTest):
             "steps_per_print": 1
         }
         hidden_dim = 10
-
         model = SimpleModel(hidden_dim)
         optimizer = torch.optim.AdamW(params=model.parameters())
         # TODO: no way to set DeepSpeedEngine.deepspeed_io params, need to use
@@ -49,8 +48,13 @@ class TestDataLoaderDropLast(DistributedTest):
                                                                 training_data=train_dataset,
                                                                 optimizer=optimizer)
         for n, batch in enumerate(training_dataloader):
-            x = batch[0].to(torch.cuda.current_device())
-            y = batch[1].to(torch.cuda.current_device())
+            if bool(pytest.use_hpu) == True:
+                from habana_frameworks.torch.hpu import current_device
+                x = batch[0].to("hpu:" + str(current_device()))
+                y = batch[1].to("hpu:" + str(current_device()))
+            else:
+                x = batch[0].to(torch.cuda.current_device())
+                y = batch[1].to(torch.cuda.current_device())
             loss = model(x, y)
             model.backward(loss)
             model.step()

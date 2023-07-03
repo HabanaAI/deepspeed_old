@@ -22,6 +22,7 @@ from ..moe.utils import has_moe_layers
 from ..runtime.zero import GatheredParameters
 from ..module_inject import LinearAllreduce, LinearLayer, Normalize, ReplaceWithTensorSlicing
 from ..module_inject.replace_policy import DSPolicy
+from ..runtime.utils import get_use_hpu, torch_check_hpu_fp16_supported
 
 DS_INFERENCE_ENABLED = False
 from torch import nn
@@ -53,6 +54,15 @@ class InferenceEngine(Module):
         if hasattr(self.module, "config"):
             DSPolicy.hf_model_config = self.module.config
 
+
+        self.use_hpu = get_use_hpu()
+        if self.use_hpu:
+            self.fp16_supported = torch_check_hpu_fp16_supported()
+        else:
+            self.fp16_supported = True
+        if config.dtype == torch.half and not self.fp16_supported:
+            raise ValueError("Type fp16 is not supported.")
+
         # todo: keep this self.injection_dict because we don't use to change config.injection_policy API
         # todo: this will get changed when Molly's PR on auto injection dict is merged
         self.injection_dict = config.injection_policy
@@ -79,14 +89,18 @@ class InferenceEngine(Module):
         self._model_times = []
 
         # This is a hack to remove the prepare_mask function on HF side for BLOOM architecture
-        self.remove_mask_prepare_for_bloom()
+        #TODO:[SW-122084] need to understand why this hack was added in DS.
+        # self.remove_mask_prepare_for_bloom()
 
         if config.enable_cuda_graph:
             assert pkg_version.parse(torch.__version__) >= pkg_version.parse("1.10"), \
                 "If you want to use cuda graph, please upgrade torch to at least v1.10"
 
-        if config.checkpoint and not config.replace_with_kernel_inject:
-            self._load_checkpoint(config.checkpoint)
+        #TODO:[SW-111289] This fails for bigger models that don't fit in host memory and use 'meta' device
+        # It needs to be investigated why that code path was disabled
+        # if config.checkpoint and not config.replace_with_kernel_inject:
+        #     self._load_checkpoint(config.checkpoint)
+
 
         # convert model to intended dtype
         if config.dtype:
@@ -109,11 +123,13 @@ class InferenceEngine(Module):
             self._create_ep_parallel_group(config.moe.moe_experts)
 
         # retain this from the old conditional argument being passed to apply_injection_policy()
-        if not config.replace_with_kernel_inject:
-            config.checkpoint = None
+        # comment out this to load checkpoint as part of _apply_injection_policy
+        # if not config.replace_with_kernel_inject:
+        #     config.checkpoint = None
 
         if self.injection_dict:
             for client_module, injection_policy in self.injection_dict.items():
+
                 # construct the tuple and pass that instead of a string or dict.
                 if isinstance(injection_policy, str):
                     config.injection_policy_tuple = (injection_policy, )
@@ -123,15 +139,30 @@ class InferenceEngine(Module):
         elif config.replace_method == 'auto':
             self._apply_injection_policy(config)
 
-        device = torch.cuda.current_device()
-        self.module.to(device)
+
+        if self.use_hpu:
+            device = torch.device("hpu")
+        else:
+            device = torch.cuda.current_device()
+
+        if config.checkpoint == None or not self.use_hpu:
+            self.module.to(device)
 
         if config.tensor_parallel.tp_size > 1:
-            _rng_state = torch.cuda.get_rng_state().to(torch.cuda.current_device())
-            dist.broadcast(_rng_state, 0)
-            torch.cuda.set_rng_state(_rng_state.cpu())
+            if self.use_hpu:
+                import habana_frameworks.torch.hpu.random as hpu_random
+                _rng_state = hpu_random.get_rng_state().to(device)
+                dist.broadcast(_rng_state, 0)
+                hpu_random.set_rng_state(_rng_state.cpu())
+            else:
+                _rng_state = torch.cuda.get_rng_state().to(torch.cuda.current_device())
+                dist.broadcast(_rng_state, 0)
+                torch.cuda.set_rng_state(_rng_state.cpu())
 
-        if config.tensor_parallel.tp_size > 1:
+        if config.enable_cuda_graph and self.use_hpu:
+            import habana_frameworks.torch as ht
+            self.module = ht.hpu.wrap_in_hpu_graph(self.module)
+        elif config.tensor_parallel.tp_size > 1:
             assert not config.enable_cuda_graph, "Cuda graph is not supported for model parallelism"
 
     def profile_model_time(self, use_cuda_events=True):
@@ -141,15 +172,16 @@ class InferenceEngine(Module):
         self.model_profile_enabled = True
         self.use_cuda_events = use_cuda_events
         if self.use_cuda_events:
-            self.timers = SynchronizedWallClockTimer()
+            self.timers = SynchronizedWallClockTimer(use_hpu=self.use_hpu)
 
     # todo: remove this once all the config dicts are centralized from top level pydantic config
     def _get_model_config_generate(self, config):
         # this is being passed to replace_transformer_layer(config=self.user_model_config_dict)
         self.config = getattr(self.module,
                               'config',
-                              None) if config.config is None else config.config
+                              None)
         # todo: clarify with Reza if this gets used anywhere
+
         self.generate = getattr(self.module, 'generate', None)
 
     def remove_mask_prepare_for_bloom(self):
@@ -161,7 +193,11 @@ class InferenceEngine(Module):
         if self.use_cuda_events:
             self.timers(INFERENCE_MODEL_TIMER).start()
         else:
-            torch.cuda.synchronize()
+            if self.use_hpu:
+                import habana_frameworks.torch as htorch
+                htorch.hpu.synchronize()
+            else:
+                torch.cuda.synchronize()
             self._start = time.time()
 
     def _post_forward_hook(self, module, input, output):
@@ -169,7 +205,11 @@ class InferenceEngine(Module):
             self.timers(INFERENCE_MODEL_TIMER).stop()
             elapsed_time = self.timers(INFERENCE_MODEL_TIMER).elapsed(reset=True)
         else:
-            torch.cuda.synchronize()
+            if self.use_hpu:
+                import habana_frameworks.torch as htorch
+                htorch.hpu.synchronize()
+            else:
+                torch.cuda.synchronize()
             self._end = time.time()
             elapsed_time = self._end - self._start
         self._model_times.append(elapsed_time)
@@ -177,9 +217,14 @@ class InferenceEngine(Module):
     def _create_model_parallel_group(self, config):
         # Call the init process
         if InferenceEngine.inference_mp_group is None:
-            init_distributed()
-            local_rank = int(os.getenv('LOCAL_RANK', '0'))
-            torch.cuda.set_device(local_rank)
+            if self.use_hpu:
+                init_distributed(dist_backend="hccl")
+            else:
+                init_distributed()
+
+            if torch.cuda.is_available():
+                local_rank = int(os.getenv('LOCAL_RANK', '0'))
+                torch.cuda.set_device(local_rank)
 
             ranks = [i for i in range(config.tensor_parallel.tp_size)]
             self.mp_group = dist.new_group(ranks)
@@ -256,7 +301,7 @@ class InferenceEngine(Module):
                 f"checkpoint must be None, str or dict, got {type(self._config.checkpoint)}"
             )
 
-        supported_dtypes = [None, torch.half, torch.int8, torch.float]
+        supported_dtypes = [None, torch.half, torch.int8, torch.float, torch.bfloat16]
         if self._config.dtype not in supported_dtypes:
             raise ValueError(
                 f"{self._config.dtype} not supported, valid dtype: {supported_dtypes}")
@@ -268,7 +313,9 @@ class InferenceEngine(Module):
     def load_model_with_checkpoint(self, r_module):
         self.mp_replace = ReplaceWithTensorSlicing(
             mp_group=self.mp_group,
-            mp_size=self._config.tensor_parallel.tp_size)  #, out_dim=0, in_dim=1)
+            mp_size=self._config.tensor_parallel.tp_size,
+            device=torch.device("hpu") if self.use_hpu else torch.cuda.current_device())  #, out_dim=0, in_dim=1)
+
         error_msgs = []
 
         def load(module, state_dict, prefix):
@@ -337,7 +384,7 @@ class InferenceEngine(Module):
         checkpoint_dir = config.checkpoint
         checkpoint = SDLoaderFactory.get_sd_loader_json(
             checkpoint_dir,
-            self.checkpoint_engine) if checkpoint_dir is not None else None
+            self.checkpoint_engine, device=self.module.device) if checkpoint_dir is not None else None
 
         generic_injection(self.module,
                           fp16=(config.dtype == torch.half)
@@ -350,7 +397,8 @@ class InferenceEngine(Module):
                                       self.module,
                                       checkpoint,
                                       config,
-                                      self.config)
+                                      self.config,
+                                      use_hpu=self.use_hpu)
 
     def _get_all_ckpt_names(self, checkpoints_path, tag):
         ckpt_file_pattern = self._get_ckpt_name(checkpoints_path,
@@ -388,10 +436,12 @@ class InferenceEngine(Module):
                         tag = fd.read().strip()
 
             ckpt_list = self._get_all_ckpt_names(load_dir, tag)
-            sd_loader = SDLoaderFactory.get_sd_loader(ckpt_list, self.checkpoint_engine)
+            sd_loader = SDLoaderFactory.get_sd_loader(ckpt_list, self.checkpoint_engine,
+                                                      device=self.module.device)
         else:
             sd_loader = SDLoaderFactory.get_sd_loader_json(load_dir,
-                                                           self.checkpoint_engine)
+                                                           self.checkpoint_engine,
+                                                           device=self.module.device)
 
         if type(sd_loader) is list:
             self.sd = torch.load(sd_loader[0], map_location='cpu')
@@ -504,17 +554,20 @@ class InferenceEngine(Module):
 
     def forward(self, *inputs, **kwargs):
         """Execute forward propagation
-
         Arguments:
             *inputs: Variable length input list
             **kwargs: variable length keyword arguments
         """
         start = None
         if self.model_profile_enabled and self._config.enable_cuda_graph:
-            torch.cuda.synchronize()
+            if self.use_hpu:
+                import habana_frameworks.torch as htorch
+                htorch.hpu.synchronize()
+            else:
+                torch.cuda.synchronize()
             start = time.time()
 
-        if self._config.enable_cuda_graph:
+        if self._config.enable_cuda_graph and not self.use_hpu:
             if self.cuda_graph_created:
                 outputs = self._graph_replay(*inputs, **kwargs)
             else:
@@ -524,7 +577,11 @@ class InferenceEngine(Module):
             outputs = self.module(*inputs, **kwargs)
 
         if self.model_profile_enabled and self._config.enable_cuda_graph:
-            torch.cuda.synchronize()
+            if self.use_hpu:
+                import habana_frameworks.torch as htorch
+                htorch.hpu.synchronize()
+            else:
+                torch.cuda.synchronize()
             duration = time.time() - start
             self._model_times.append(duration)
 

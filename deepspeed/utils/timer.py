@@ -27,31 +27,61 @@ class CudaEventTimer(object):
         self.end_event.synchronize()
         return self.start_event.elapsed_time(self.end_event)
 
+class HpuEventTimer(object):
+    def __init__(self, start_event, end_event, habana_module):
+        self.start_event = start_event
+        self.end_event = end_event
+        self.habana_module = habana_module
+
+    def get_elapsed_msec(self):
+        self.habana_module.hpu.current_stream().wait_event(self.end_event)
+        self.end_event.synchronize()
+        return self.start_event.elapsed_time(self.end_event)
 
 class SynchronizedWallClockTimer:
     """Group of timers. Borrowed from Nvidia Megatron code"""
     class Timer:
         """Timer."""
-        def __init__(self, name):
+        def _get_hpu_module(self):
+            if self.habana_module is None:
+                import habana_frameworks.torch as ht
+                self.habana_module = ht
+            # return self.habana_module
+        def __init__(self, name, use_hpu=False):
             self.name_ = name
             self.started_ = False
             self.event_timers = []
             self.start_event = None
             self.elapsed_records = None
+            self.habana_module = None
+            self.use_hpu = use_hpu
+            if (use_hpu):
+                self._get_hpu_module()
 
         def start(self):
             """Start the timer."""
             assert not self.started_, f"{self.name_} timer has already been started"
-            self.start_event = torch.cuda.Event(enable_timing=True)
+            if (self.use_hpu):
+                # import habana_frameworks.torch as ht
+                self.start_event = self.habana_module.hpu.Event(enable_timing=True)
+            else:
+                self.start_event = torch.cuda.Event(enable_timing=True)
             self.start_event.record()
             self.started_ = True
 
         def stop(self, reset=False, record=False):
             """Stop the timer."""
             assert self.started_, "timer is not started"
-            end_event = torch.cuda.Event(enable_timing=True)
+            if (self.use_hpu):
+                # import habana_frameworks.torch as ht
+                end_event = self.habana_module.hpu.Event(enable_timing=True)
+            else:
+                end_event = torch.cuda.Event(enable_timing=True)
             end_event.record()
-            self.event_timers.append(CudaEventTimer(self.start_event, end_event))
+            if (self.use_hpu):
+                self.event_timers.append(HpuEventTimer(self.start_event, end_event, self.habana_module))
+            else:
+                self.event_timers.append(CudaEventTimer(self.start_event, end_event))
             self.start_event = None
             self.started_ = False
 
@@ -87,7 +117,8 @@ class SynchronizedWallClockTimer:
             self.elapsed(reset=False)
             return trim_mean(self.elapsed_records, 0.1)
 
-    def __init__(self):
+    def __init__(self, use_hpu=False):
+        self.use_hpu = use_hpu
         self.timers = {}
 
     def get_timers(self):
@@ -95,7 +126,7 @@ class SynchronizedWallClockTimer:
 
     def __call__(self, name):
         if name not in self.timers:
-            self.timers[name] = self.Timer(name)
+            self.timers[name] = self.Timer(name, self.use_hpu)
         return self.timers[name]
 
     @staticmethod
@@ -141,6 +172,8 @@ class ThroughputTimer:
         steps_per_output=50,
         monitor_memory=False,
         logging_fn=None,
+        synchronize_fn=torch.cuda.synchronize,
+        mem_stats_fn=None
     ):
         from deepspeed.utils import logger
         self.start_time = 0
@@ -161,6 +194,8 @@ class ThroughputTimer:
         if self.logging is None:
             self.logging = logger.info
         self.initialized = False
+        self.synchronize_fn = synchronize_fn
+        self.mem_stats_fn = mem_stats_fn
 
         if self.monitor_memory and not PSUTILS_INSTALLED:
             raise ImportError("Unable to import 'psutils', please install package")
@@ -176,7 +211,8 @@ class ThroughputTimer:
         self._init_timer()
         self.started = True
         if self.total_step_count >= self.start_step:
-            torch.cuda.synchronize()
+            if self.synchronize_fn:
+                self.synchronize_fn()
             self.start_time = time.time()
 
     def stop(self, report_speed=True):
@@ -186,26 +222,32 @@ class ThroughputTimer:
         self.total_step_count += 1
         self.local_step_count += 1
         if self.total_step_count > self.start_step:
-            torch.cuda.synchronize()
+            if self.synchronize_fn:
+                self.synchronize_fn()
             self.end_time = time.time()
             duration = self.end_time - self.start_time
             self.total_elapsed_time += duration
 
             curr_samples_sec = (self.batch_size * self.num_workers) / duration
+            if self.local_step_count % self.steps_per_output == 0:
+                if report_speed:
+                    mem_stats = ""
+                    if self.mem_stats_fn is not None:
+                        (used, peak) = self.mem_stats_fn()
+                        mem_stats = f", MemAllocated={round(used/1024**3, 2)}GB, MaxMemAllocated={round(peak/1024**3, 2)}GB"
+                    else:
+                        mem_stats = f", MemAllocated={round(torch.cuda.memory_allocated() / 1024**3, 2)}GB,\
+                                MaxMemAllocated={round(torch.cuda.max_memory_allocated() / 1024**3, 2)}GB"
+                    self.logging(
+                        "{}/{}, RunningAvgSamplesPerSec={}, CurrSamplesPerSec={}{}"
+                        .format(
+                            self.epoch_count,
+                            self.local_step_count,
+                            self.avg_samples_per_sec(),
+                            curr_samples_sec,
+                            mem_stats
+                        ))
 
-            if report_speed:
-                self.logging(
-                    "{}/{}, RunningAvgSamplesPerSec={}, CurrSamplesPerSec={}, MemAllocated={}GB, MaxMemAllocated={}GB"
-                    .format(
-                        self.epoch_count,
-                        self.local_step_count,
-                        self.avg_samples_per_sec(),
-                        curr_samples_sec,
-                        round(torch.cuda.memory_allocated() / 1024**3,
-                              2),
-                        round(torch.cuda.max_memory_allocated() / 1024**3,
-                              2),
-                    ))
                 if self.monitor_memory:
                     virt_mem = psutil.virtual_memory()
                     swap = psutil.swap_memory()

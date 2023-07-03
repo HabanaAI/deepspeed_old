@@ -20,7 +20,8 @@ from deepspeed.runtime.utils import (get_global_norm_of_tensors,
                                      all_gather_dp_groups,
                                      bwc_tensor_model_parallel_rank,
                                      is_model_parallel_parameter,
-                                     see_memory_usage)
+                                     see_memory_usage,
+                                     reorder_optimizer_groups)
 
 from deepspeed.utils import link_hp_params, fragment_address
 from deepspeed.checkpoint import enable_universal_checkpoint
@@ -44,7 +45,10 @@ class BF16_Optimizer(ZeROOptimizer):
                  norm_type=2,
                  allgather_bucket_size=5000000000,
                  dp_process_group=None,
-                 timers=None):
+                 timers=None,
+                 # TODO SW-97921: remove this WA code when SW-97305 is resolved
+                 max_group_size=4e9,
+                 grad_acc_dtype=None):
         super().__init__()
         see_memory_usage('begin bf16_optimizer', force=True)
         self.timers = timers
@@ -58,6 +62,11 @@ class BF16_Optimizer(ZeROOptimizer):
         self.allgather_bucket_size = int(allgather_bucket_size)
         self.dp_process_group = dp_process_group
         self.dp_rank = dist.get_rank(group=self.dp_process_group)
+        self.max_group_size = int(max_group_size)
+        self.grad_acc_dtype = grad_acc_dtype
+        new_param_groups = reorder_optimizer_groups(self.optimizer.param_groups, self.max_group_size)
+        self.optimizer.param_groups = None
+        self.optimizer.param_groups = new_param_groups
         self.real_dp_process_group = [
             dp_process_group for i in range(len(self.optimizer.param_groups))
         ]
@@ -111,7 +120,10 @@ class BF16_Optimizer(ZeROOptimizer):
                 self._flatten_dense_tensors_aligned(
                     self.bf16_groups[i],
                     self.nccl_start_alignment_factor * dp_world_size))
-
+            #SW-106586 this mark step to WA "Expected in.DataPtrValidAndNotExpired() to be true, but got false." error
+            if self.bf16_groups[0][0].device.type=="hpu":
+                import habana_frameworks.torch.core as htcore
+                htcore.mark_step()
             # Make bf16 params point to flat tensor storage
             self._update_storage_to_flattened_tensor(
                 tensor_list=self.bf16_groups[i],
@@ -135,9 +147,10 @@ class BF16_Optimizer(ZeROOptimizer):
             num_elem_list = [t.numel() for t in self.bf16_groups[i]]
 
             # create fp32 gradients
+            assert self.grad_acc_dtype in [torch.float32, torch.bfloat16]
             self.fp32_groups_gradients_flat.append(
                 torch.zeros_like(self.bf16_groups_flat[i],
-                                 dtype=torch.float32))
+                                 dtype=self.grad_acc_dtype))
 
             # track individual fp32 gradients for entire model
             fp32_gradients = self._split_flat_tensor(
@@ -226,9 +239,16 @@ class BF16_Optimizer(ZeROOptimizer):
         beginning of training instead of after activations have been allocated.
         """
         for param_partition, grad_partition in zip(self.fp32_groups_flat_partition, self.fp32_groups_gradient_flat_partition):
-            param_partition.grad = grad_partition
+            if self.grad_acc_dtype is torch.bfloat16:
+                param_partition.grad = grad_partition.to(param_partition.dtype)
+            else:
+                param_partition.grad = grad_partition
 
         self.optimizer.step()
+
+        if self.grad_acc_dtype is torch.bfloat16:
+            for param_partition in self.fp32_groups_flat_partition:
+                param_partition.grad = None
 
         self.clear_hp_grads()
 
@@ -270,7 +290,18 @@ class BF16_Optimizer(ZeROOptimizer):
                 global_norm=all_groups_norm,
                 mpu=self.mpu)
 
+
+        for param_partition, grad_partition in zip(self.fp32_groups_flat_partition, self.fp32_groups_gradient_flat_partition):
+            if self.grad_acc_dtype is torch.bfloat16:
+                param_partition.grad = grad_partition.to(param_partition.dtype)
+            else:
+                param_partition.grad = grad_partition
+
         self.optimizer.step()
+
+        if self.grad_acc_dtype is torch.bfloat16:
+            for param_partition in self.fp32_groups_flat_partition:
+                param_partition.grad = None
 
         self.update_lp_params()
 
@@ -332,7 +363,6 @@ class BF16_Optimizer(ZeROOptimizer):
                     continue
 
                 grads.append(self.fp32_groups_gradients[i][j])
-
         return grads
 
     @torch.no_grad()
@@ -344,6 +374,7 @@ class BF16_Optimizer(ZeROOptimizer):
             # if i == 0:
             #     print_rank_0(f'{fp32_partition[:10]=}', force=True)
 
+        #TODO: SW-90304 call all_gather_dp_groups with async_op=true if zero optimizer hpu_use_async_collectives is enabled
         all_gather_dp_groups(partitioned_param_groups=self.bf16_partitioned_groups,
                              dp_process_group=self.real_dp_process_group,
                              start_alignment_factor=self.nccl_start_alignment_factor,
@@ -447,6 +478,19 @@ class BF16_Optimizer(ZeROOptimizer):
                                      self.param_names[lp]),
                         tp_rank,
                         tp_world_size)
+
+    def update_steps(self, steps):
+        self.step_count = steps
+        state = self.optimizer.state
+        for group in self.param_groups:
+            if 'step' in group:
+                group['step'] = steps + 1
+            for p in group['params']:
+                if p in state and len(state[p]) > 0 and 'step' in state[p]:
+                    if isinstance(state[p]['step'], torch.Tensor):
+                        state[p]['step'] = torch.tensor(steps + 1, dtype=torch.float, device=p.device)
+                    else:
+                        state[p]['step'] = steps + 1
 
 
 def _get_padded_tensor(src_tensor, size):

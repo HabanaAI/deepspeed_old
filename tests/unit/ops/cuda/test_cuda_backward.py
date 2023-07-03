@@ -14,6 +14,10 @@ from unit.modelingpreln import BertEncoder as BertEncoderPreln
 #    "transformer kernels are temporarily disabled because of unexplained failures",
 #    allow_module_level=True)
 
+pytestmark = pytest.mark.skipif(
+    bool(pytest.use_hpu) == True,
+    reason="CUDA tests not supported by HPU")
+
 
 def check_equal(first, second, atol=1e-2, verbose=False):
     diction_x = {}

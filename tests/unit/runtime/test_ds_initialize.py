@@ -1,5 +1,6 @@
 import pytest
 from typing import Callable
+import os
 import torch
 from torch.optim import Optimizer, Adam, AdamW
 from torch.optim.lr_scheduler import _LRScheduler, LambdaLR
@@ -13,6 +14,7 @@ from deepspeed.ops.adam import FusedAdam
 from deepspeed.runtime.lr_schedules import WARMUP_LR, WarmupLR
 from deepspeed.runtime.config import ADAM_OPTIMIZER
 from deepspeed.runtime.utils import see_memory_usage
+from unit.hpu import *
 
 
 @pytest.mark.parametrize('zero_stage', [0, 3])
@@ -38,6 +40,15 @@ class TestNoOptim(DistributedTest):
         # 20B test
         #hidden_dim = 16 * 1024
         hidden_dim = 4
+        dtype=torch.half
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                ds_config["fp16"]["enabled"] = False
+                ds_config["fp32"] = {"enabled" : True}
+                dtype=torch.float
+            hpu_flag, msg = is_hpu_supported(ds_config)
+            if not hpu_flag:
+                pytest.skip(msg)
 
         with deepspeed.zero.Init(enabled=zero_stage == 3, config_dict_or_path=ds_config):
             model = SimpleModel(hidden_dim, nlayers=78)
@@ -48,7 +59,7 @@ class TestNoOptim(DistributedTest):
                                         total_samples=50,
                                         hidden_dim=hidden_dim,
                                         device=model.device,
-                                        dtype=torch.half)
+                                        dtype=dtype)
         for batch in data_loader:
             model(batch[0], batch[1])
         see_memory_usage('post-fwds', force=True)
@@ -73,7 +84,9 @@ class TestClientOptimizer(DistributedTest):
             client_optimizer = Adam(model.parameters())
         else:
             client_optimizer = _optimizer_callable
-
+        if bool(pytest.use_hpu) == True:
+            if optimizer_type == None:
+                pytest.skip("Fused Adam related tests not supported by HPU")
         _, ds_optimizer, _, _ = deepspeed.initialize(config=config_dict,
                                                     model=model,
                                                     model_parameters=list(model.parameters()),
@@ -86,6 +99,7 @@ class TestClientOptimizer(DistributedTest):
             assert isinstance(ds_optimizer, AdamW)
 
 
+@pytest.mark.skipif(bool(pytest.use_hpu) == True, reason="HPU not supported FusedAdam related tests.")
 @pytest.mark.parametrize('client_parameters', [True, False])
 class TestConfigOptimizer(DistributedTest):
     world_size = 1
@@ -128,7 +142,7 @@ class TestOptimizerImplementation(DistributedTest):
         fp16 = True if model_dtype == 'fp16' else False
         bf16 = True if model_dtype == 'bf16' else False
         # Skip checks
-        if bf16 and not bf16_required_version_check():
+        if bf16 and not bf16_required_version_check() and not bool(pytest.use_hpu) == True:
             pytest.skip(
                 "DeepSpeed BFloat16 tests need torch >= 1.10, NCCL >= 2.10.3, CUDA > =11.0 and HW support for BFloat16 to run correctly"
             )
@@ -159,6 +173,10 @@ class TestOptimizerImplementation(DistributedTest):
                 }
             }
         }
+        if bool(pytest.use_hpu) == True:
+            hpu_flag, msg = is_hpu_supported(ds_config)
+            if not hpu_flag:
+                pytest.skip(msg)
 
         key = (optimizer_extension, model_dtype, grad_accum_dtype)
 
@@ -167,6 +185,7 @@ class TestOptimizerImplementation(DistributedTest):
         # Zero Wrapper
         is_supported[('zero', 'fp16', None)] = True
         is_supported[('zero', 'fp16', 'fp16')] = True
+        is_supported[('zero', 'bf16', None)] = True
         is_supported[('zero', 'bf16', 'bf16')] = True
         is_supported[('zero', 'fp32', None)] = True
         is_supported[('zero', 'fp32', 'fp32')] = True

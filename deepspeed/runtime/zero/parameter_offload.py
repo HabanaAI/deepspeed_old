@@ -184,13 +184,17 @@ class DeepSpeedZeRoOffload(object):
                  param_persistence_threshold=100000,
                  model_persistence_threshold=sys.maxsize,
                  offload_param_config=None,
-                 mpu=None):
+                 mpu=None,
+                 use_hpu=False,
+                 no_cuda=False):
 
         see_memory_usage("DeepSpeedZeRoOffload initialize [begin]", force=True)
 
         print_rank_0(f"initialized {__class__.__name__} with args: {locals()}",
                      force=False)
 
+        self.no_cuda = no_cuda
+        self.use_hpu = use_hpu
         self.module = module
         self.dtype = list(module.parameters())[0].dtype
         self.offload_device = None
@@ -217,8 +221,8 @@ class DeepSpeedZeRoOffload(object):
         self._prefetch_bucket_sz = int(prefetch_bucket_size)
         self._max_reuse_distance_in_numel = int(max_reuse_distance)
         self._max_available_parameters_in_numel = int(max_live_parameters)
-        self.__allgather_stream = Stream(
-        ) if overlap_comm else torch.cuda.default_stream()
+        self.__allgather_stream = create_stream(self.use_hpu, self.no_cuda
+        ) if overlap_comm else get_default_stream(self.use_hpu, self.no_cuda)
 
         self.forward_hooks = []
         self.backward_hooks = []
@@ -249,6 +253,8 @@ class DeepSpeedZeRoOffload(object):
                 _max_available_parameters_in_numel,
                 allgather_stream=self.__allgather_stream,
                 prefetch_nvme=self.offload_device == OffloadDeviceEnum.nvme,
+                use_hpu=self.use_hpu,
+                no_cuda=self.no_cuda
             )
 
         return self.param_coordinators[training]
@@ -270,7 +276,9 @@ class DeepSpeedZeRoOffload(object):
                      config_dict_or_path=ds_config,
                      remote_device=self.offload_device,
                      pin_memory=self.offload_param_pin_memory,
-                     mpu=mpu)
+                     mpu=mpu,
+                     use_hpu=self.use_hpu,
+                     no_cuda=self.no_cuda)
 
     def destroy(self):
         self._remove_module_hooks()

@@ -112,6 +112,7 @@ class OpBuilder(ABC):
         self.name = name
         self.jit_mode = False
         self.error_log = None
+        self.use_hpu = False
 
     @abstractmethod
     def absolute_name(self):
@@ -402,7 +403,7 @@ class OpBuilder(ABC):
                 return '-D__SCALAR__'
 
         if cpu_info['arch'] == 'X86_64':
-            if 'avx512' in cpu_info['flags']:
+            if ('avx512' in cpu_info['flags'] and not self.use_hpu):
                 return '-D__AVX512__'
             elif 'avx2' in cpu_info['flags']:
                 return '-D__AVX256__'
@@ -449,10 +450,12 @@ class OpBuilder(ABC):
 
     def load(self, verbose=True):
         from ...git_version_info import installed_ops, torch_info
+        from deepspeed.runtime.utils import get_use_hpu
+        self.use_hpu = get_use_hpu()
         if installed_ops[self.name]:
             # Ensure the op we're about to load was compiled with the same
             # torch/cuda versions we are currently using at runtime.
-            if isinstance(self, CUDAOpBuilder):
+            if isinstance(self, CUDAOpBuilder) and not self.use_hpu:
                 self.assert_torch_info(torch_info)
 
             return importlib.import_module(self.absolute_name())
@@ -471,7 +474,7 @@ class OpBuilder(ABC):
                 f"Unable to JIT load the {self.name} op due to ninja not being installed."
             )
 
-        if isinstance(self, CUDAOpBuilder) and not self.is_rocm_pytorch():
+        if isinstance(self, CUDAOpBuilder) and not self.is_rocm_pytorch() and not self.use_hpu:
             assert_no_cuda_mismatch()
 
         self.jit_mode = True
@@ -499,7 +502,8 @@ class OpBuilder(ABC):
             extra_cflags=self.strip_empty_entries(self.cxx_args()),
             extra_cuda_cflags=self.strip_empty_entries(self.nvcc_args()),
             extra_ldflags=self.strip_empty_entries(self.extra_ldflags()),
-            verbose=verbose)
+            verbose=verbose,
+            with_cuda=(not self.use_hpu))
         build_duration = time.time() - start_build
         if verbose:
             print(f"Time to load {self.name} op: {build_duration} seconds")
@@ -639,28 +643,29 @@ class CUDAOpBuilder(OpBuilder):
 
     def nvcc_args(self):
         args = ['-O3']
-        if self.is_rocm_pytorch():
-            ROCM_MAJOR, ROCM_MINOR = self.installed_rocm_version()
-            args += [
-                '-std=c++14',
-                '-U__HIP_NO_HALF_OPERATORS__',
-                '-U__HIP_NO_HALF_CONVERSIONS__',
-                '-U__HIP_NO_HALF2_OPERATORS__',
-                '-DROCM_VERSION_MAJOR=%s' % ROCM_MAJOR,
-                '-DROCM_VERSION_MINOR=%s' % ROCM_MINOR
-            ]
-        else:
-            cuda_major, _ = installed_cuda_version()
-            args += [
-                '-allow-unsupported-compiler' if sys.platform == "win32" else '',
-                '--use_fast_math',
-                '-std=c++17'
-                if sys.platform == "win32" and cuda_major > 10 else '-std=c++14',
-                '-U__CUDA_NO_HALF_OPERATORS__',
-                '-U__CUDA_NO_HALF_CONVERSIONS__',
-                '-U__CUDA_NO_HALF2_OPERATORS__'
-            ]
-            args += self.compute_capability_args()
+        if not self.use_hpu:
+            if self.is_rocm_pytorch():
+                ROCM_MAJOR, ROCM_MINOR = self.installed_rocm_version()
+                args += [
+                    '-std=c++14',
+                    '-U__HIP_NO_HALF_OPERATORS__',
+                    '-U__HIP_NO_HALF_CONVERSIONS__',
+                    '-U__HIP_NO_HALF2_OPERATORS__',
+                    '-DROCM_VERSION_MAJOR=%s' % ROCM_MAJOR,
+                    '-DROCM_VERSION_MINOR=%s' % ROCM_MINOR
+                ]
+            else:
+                cuda_major, _ = installed_cuda_version()
+                args += [
+                    '-allow-unsupported-compiler' if sys.platform == "win32" else '',
+                    '--use_fast_math',
+                    '-std=c++17'
+                    if sys.platform == "win32" and cuda_major > 10 else '-std=c++14',
+                    '-U__CUDA_NO_HALF_OPERATORS__',
+                    '-U__CUDA_NO_HALF_CONVERSIONS__',
+                    '-U__CUDA_NO_HALF2_OPERATORS__'
+                ]
+                args += self.compute_capability_args()
         return args
 
     def libraries_args(self):
@@ -672,28 +677,32 @@ class CUDAOpBuilder(OpBuilder):
 
 class TorchCPUOpBuilder(CUDAOpBuilder):
     def extra_ldflags(self):
-        if not self.is_rocm_pytorch():
+        if not self.is_rocm_pytorch() and not self.use_hpu:
             return ['-lcurand']
         else:
             return []
 
     def cxx_args(self):
         import torch
-        if not self.is_rocm_pytorch():
-            CUDA_LIB64 = os.path.join(torch.utils.cpp_extension.CUDA_HOME, "lib64")
-        else:
-            CUDA_LIB64 = os.path.join(torch.utils.cpp_extension.ROCM_HOME, "lib")
+        if not self.use_hpu:
+            if not self.is_rocm_pytorch():
+                CUDA_LIB64 = os.path.join(torch.utils.cpp_extension.CUDA_HOME, "lib64")
+            else:
+                CUDA_LIB64 = os.path.join(torch.utils.cpp_extension.ROCM_HOME, "lib")
         CPU_ARCH = self.cpu_arch()
         SIMD_WIDTH = self.simd_width()
-
         args = super().cxx_args()
-        args += [
-            f'-L{CUDA_LIB64}',
-            '-lcudart',
-            '-lcublas',
-            '-g',
-            CPU_ARCH,
-            '-fopenmp',
-            SIMD_WIDTH,
+        if not self.use_hpu:
+            args += [
+                f'-L{CUDA_LIB64}',
+                '-lcudart',
+                '-lcublas',
+            ]
+        else:
+            args = ['-DUSE_HPU',]
+        args += [SIMD_WIDTH,
+                 '-g',
+                 CPU_ARCH,
+                 '-fopenmp',
         ]
         return args

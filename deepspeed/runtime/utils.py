@@ -11,17 +11,77 @@ from deepspeed.moe.utils import is_moe_param
 import os
 import psutil
 import gc
+# TODO SW-97921: remove this WA code when SW-97305 is resolved
+import copy
 from math import sqrt
 from math import floor
 from bisect import bisect_left
 
 import torch
-from torch._six import inf
+from torch import inf
 from deepspeed import comm as dist
 
 from deepspeed.utils import groups, logger
 from deepspeed.runtime.constants import PIPE_REPLICATED
 from numpy import prod
+
+USE_HPU=None
+habana_module = None
+
+def get_use_hpu():
+    global USE_HPU
+    if USE_HPU is None:
+        USE_HPU = os.getenv("DEEPSPEED_USE_HPU", 'False').lower() in ('true', '1', 't')
+        if USE_HPU:
+            set_use_hpu()
+    return USE_HPU
+
+def set_use_hpu():
+    global habana_module
+    global torch_memory_reserved
+    global torch_max_memory_reserved
+    global torch_memory_allocated
+    global torch_max_memory_allocated
+    import habana_frameworks.torch.hpu as htcore
+    habana_module=htcore
+    torch_memory_reserved = habana_module.memory_allocated
+    def not_implemented():
+        logger.warning("max_memory_reserved is not implemented on HPU")
+        return 0
+    torch_max_memory_reserved = not_implemented
+    torch_memory_allocated = habana_module.memory_allocated
+    torch_max_memory_allocated = habana_module.max_memory_allocated
+
+# TODO SW-97921: remove this WA code when SW-97305 is resolved
+def reorder_optimizer_groups(param_groups, max_group_size):
+    new_grouped_parameters = []
+    for group in param_groups:
+        template_group = {}
+        for key, value in group.items():
+            if key == "params":
+                continue
+            template_group[key] = value
+        template_group['params'] = []
+        new_group = copy.deepcopy(template_group)
+        new_group_size = 0
+        for param in group['params']:
+            curr_param_size = torch.numel(param)
+            assert curr_param_size <= max_group_size, \
+                f'one optimizer parameter has a size of {curr_param_size} bytes, which is greater \
+                than {max_group_size} bytes! can not handle such tensor'
+
+            if new_group_size + curr_param_size <= max_group_size:
+                new_group['params'].append(param)
+                new_group_size += curr_param_size
+            else:
+                new_grouped_parameters.append(new_group)
+                new_group = copy.deepcopy(template_group)
+                new_group['params'].append(param)
+                new_group_size = curr_param_size
+        if len(new_group['params']) > 0:
+            new_grouped_parameters.append(new_group)
+
+    return new_grouped_parameters
 
 # pt-1.9 deprecations
 if hasattr(torch.cuda, "memory_reserved"):
@@ -32,7 +92,13 @@ if hasattr(torch.cuda, "max_memory_reserved"):
     torch_max_memory_reserved = torch.cuda.max_memory_reserved
 else:
     torch_max_memory_reserved = torch.cuda.memory_cached
+torch_memory_allocated = torch.cuda.memory_allocated
+torch_max_memory_allocated = torch.cuda.max_memory_allocated
 
+def torch_check_hpu_fp16_supported():
+    # TODO: remove workaround https://jira.habana-labs.com/browse/SW-141355
+    import habana_frameworks.torch.utils.experimental as htexp
+    return htexp._is_fp16_supported()
 
 class DummyOptim():
     """
@@ -168,6 +234,28 @@ def move_to_device(item, device, criterion_func):
     else:
         return item
 
+def get_current_device(use_hpu, no_cuda):
+    if use_hpu:
+        device_str = 'hpu:' + str(habana_module.current_device())
+    elif not no_cuda:
+        device_str = 'cuda:' + str(torch.cuda.current_device())
+    else:
+        device_str = 'cpu'
+    return torch.device(device_str)
+
+# `params` is a list / generator of torch.Variable
+def has_overflow_serial_hpu(params):
+    invalid_grad_count = torch.zeros([1], dtype=torch.float,
+                                        device=get_current_device(True, True))
+    for p in params:
+        if p.grad is not None:
+            float_grad = p.grad.float()
+            nan = float_grad.isnan()
+            inf = float_grad.isinf()
+            inf_or_nan = nan.logical_or(inf)
+            invalid_grad_count += inf_or_nan.float().max()
+    return invalid_grad_count
+
 
 class CheckOverflow(object):
     '''Checks for overflow in gradient across parallel process'''
@@ -239,10 +327,13 @@ class CheckOverflow(object):
     def has_overflow(self, params, has_moe_params=None):
         if has_moe_params is None:
             has_moe_params = self.has_moe_params
-        overflow = self.has_overflow_serial(params)
-        # Since each model parallel GPU carries only part of the model,
-        # make sure overflow flag is synced across all the model parallel GPUs
-        overflow_gpu = torch.cuda.ByteTensor([overflow])
+        if get_use_hpu():
+            overflow_gpu = has_overflow_serial_hpu(params)
+        else:
+            overflow = self.has_overflow_serial(params)
+            # Since each model parallel GPU carries only part of the model,
+            # make sure overflow flag is synced across all the model parallel GPUs
+            overflow_gpu = torch.cuda.ByteTensor([overflow])
         # deepspeeed.comm.all_reduce(overflow_gpu,
         #                             op=deepspeed.comm.ReduceOp.MAX,
         #                             group=mpu.get_model_parallel_group())
@@ -348,49 +439,53 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
     parameters = list(filter(lambda p: p.grad is not None, parameters))
-    max_norm = float(max_norm)
     norm_type = float(norm_type)
+    all_norms = []
     if norm_type == inf:
-        total_norm = max(p.grad.data.abs().max() for p in parameters)
-        total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
+        for p in parameters:
+            all_norms.append(p.grad.data.abs().max().float())
+        total_norm = torch.stack(all_norms).max()
         # Take max across all GPUs.
         if mpu is not None:
-            dist.all_reduce(total_norm_cuda,
+            dist.all_reduce(total_norm,
                             op=dist.ReduceOp.MAX,
                             group=mpu.get_model_parallel_group())
-        total_norm = total_norm_cuda[0].item()
     else:
         total_norm = 0
         for p in parameters:
             if mpu is not None:
                 if (mpu.get_model_parallel_rank()
                         == 0) or is_model_parallel_parameter(p):
-                    param_norm = p.grad.data.norm(norm_type)
-                    total_norm += param_norm.item()**norm_type
+                    param_norm = p.grad.data.detach().float().norm(norm_type)
+                    all_norms.append(param_norm)
             else:
-                param_norm = p.grad.data.float().norm(norm_type)
-                total_norm += param_norm.item()**norm_type
-
+                param_norm = p.grad.data.detach().float().norm(norm_type)
+                all_norms.append(param_norm)
+        if len(all_norms) > 0:
+            total_norm = torch.stack(all_norms).square().sum().float()
+        else:
+            total_norm = torch.FloatTensor([0.0]).to(parameters[0].device)
         # Sum across all model parallel GPUs.
-        total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
         if mpu is not None:
-            dist.all_reduce(total_norm_cuda,
+            dist.all_reduce(total_norm,
                             op=dist.ReduceOp.SUM,
                             group=mpu.get_model_parallel_group())
-        total_norm = total_norm_cuda[0].item()**(1. / norm_type)
+        total_norm = total_norm.pow(1. / norm_type)
 
     # Need to average total_norm across different GPUs due to the presence of moe params
     pg = groups._get_data_parallel_group()
     scaled_norm = total_norm * 1.0 / float(dist.get_world_size(group=pg))
+    scaled_norm_tensor = scaled_norm
 
-    scaled_norm_tensor = torch.cuda.FloatTensor([float(scaled_norm)])
     dist.all_reduce(scaled_norm_tensor, group=pg)
-    total_norm = scaled_norm_tensor.item()
+    total_norm = scaled_norm_tensor
 
+    max_norm = torch.Tensor([float(max_norm)]).to(parameters[0].device)
     clip_coef = max_norm / (total_norm + 1e-6)
-    if clip_coef < 1:
-        for p in parameters:
-            p.grad.data.mul_(clip_coef)
+    tmp_tensor = torch.tensor([1.0]).to(parameters[0].device)
+    clip_coef = torch.max(tmp_tensor, clip_coef)
+    for p in parameters:
+        p.grad.data.mul_(clip_coef)
     return total_norm
 
 
@@ -545,7 +640,7 @@ def get_weight_norm(parameters, norm_type=2, mpu=None):
             total_norm += param_norm**norm_type
 
         # Sum across all model parallel GPUs.
-        total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
+        total_norm_cuda = torch.FloatTensor([float(total_norm)]).to(get_current_device())
         if mpu is not None:
             dist.all_reduce(total_norm_cuda,
                             op=dist.ReduceOp.SUM,
@@ -725,12 +820,14 @@ class PartitionedTensor:
             partition_tensors.append(buf)
 
         # Collect the full tensor
+        async_op = get_use_hpu()
         dist.all_gather(partition_tensors,
                         partition_tensors[self.rank],
-                        group=self.group)
+                        group=self.group,
+                        async_op=async_op)
 
         for i in range(len(partition_tensors)):
-            partition_tensors[i].data = torch.zeros(1)
+            partition_tensors[i].data = torch.zeros(1, device=partition_tensors[i].data.device)
             partition_tensors[i] = None
 
         return flat_tensor.view(self.full_size()).clone().detach()
@@ -776,20 +873,26 @@ def memory_status(msg, print_rank=-1, reset_max=False):
     torch.cuda.synchronize()
 
     if reset_max:
-        torch.cuda.reset_max_memory_cached()
-        torch.cuda.reset_max_memory_allocated()
+        if (get_use_hpu()):
+            habana_module.reset_max_memory_allocated()
+            new_cached = 0
+            max_cached = 0
+            logger.warning("Cached memory statistics not implemented on HPU")
+        else:
+            torch.cuda.reset_max_memory_cached()
+            torch.cuda.reset_max_memory_allocated()
+            new_cached = torch.cuda.memory_cached()
+            max_cached = torch.cuda.max_memory_cached()
 
-    new_alloced = torch.cuda.memory_allocated()
-    new_cached = torch.cuda.memory_cached()
-
+    new_alloced = torch_memory_allocated()
+ 
     delta_alloced = new_alloced - mem_alloced
     delta_cached = new_cached - mem_cached
 
     mem_cached = new_cached
     mem_alloced = new_alloced
 
-    max_alloced = torch.cuda.max_memory_allocated()
-    max_cached = torch.cuda.max_memory_cached()
+    max_alloced = torch_max_memory_allocated()
 
     # convert to GB for printing
     new_alloced /= 1024**3
@@ -811,7 +914,7 @@ def memory_status(msg, print_rank=-1, reset_max=False):
 def get_ma_status():
     if dist.is_initialized() and not dist.get_rank() == 0:
         return 0
-    return torch.cuda.memory_allocated()
+    return torch_memory_allocated()
 
 
 def see_memory_usage(message, force=False):
@@ -826,8 +929,8 @@ def see_memory_usage(message, force=False):
     # Print message except when distributed but not rank 0
     logger.info(message)
     logger.info(
-        f"MA {round(torch.cuda.memory_allocated() / (1024 * 1024 * 1024),2 )} GB \
-        Max_MA {round(torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024),2)} GB \
+        f"MA {round(torch_memory_allocated() / (1024 * 1024 * 1024),2 )} GB \
+        Max_MA {round(torch_max_memory_allocated() / (1024 * 1024 * 1024),2)} GB \
         CA {round(torch_memory_reserved() / (1024 * 1024 * 1024),2)} GB \
         Max_CA {round(torch_max_memory_reserved() / (1024 * 1024 * 1024))} GB ")
 
@@ -837,7 +940,9 @@ def see_memory_usage(message, force=False):
         f'CPU Virtual Memory:  used = {used_GB} GB, percent = {vm_stats.percent}%')
 
     # get the peak memory to report correct data, so reset the counter for the next call
-    if hasattr(torch.cuda, "reset_peak_memory_stats"):  # pytorch 1.4+
+    if (get_use_hpu() == True):
+        habana_module.reset_peak_memory_stats()
+    elif hasattr(torch.cuda, "reset_peak_memory_stats"):  # pytorch 1.4+
         torch.cuda.reset_peak_memory_stats()
 
 
@@ -909,27 +1014,31 @@ def get_global_norm_of_tensors(input_tensors, norm_type=2, mpu=None):
     assert isinstance(input_tensors, Iterable), f'expected Iterable type not {type(input_tensors)}'
     assert all([torch.is_tensor(t) for t in input_tensors]), f'expected list of only tensors'
 
+    device = input_tensors[0].device
     norm_type = float(norm_type)
+    all_norms = []
     if norm_type == inf:
-        total_norm = max(t.data.abs().max() for t in input_tensors)
-        total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
+        for t in input_tensors:
+            all_norms.append(t.data.abs().max().float())
+        total_norm_cuda = torch.stack(all_norms).max()
         if mpu is not None:
             dist.all_reduce(total_norm_cuda,
                             op=dist.ReduceOp.MAX,
                             group=mpu.get_model_parallel_group())
-            total_norm = total_norm_cuda[0].item()
+            total_norm = total_norm_cuda.item()
     else:
-        total_norm = sum(
-            [t.data.float().norm(norm_type).item()**norm_type for t in input_tensors])
-        total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
+        for t in input_tensors:
+            all_norms.append(t.data.float().norm(norm_type))
+        total_norm_cuda = torch.stack(all_norms).pow(norm_type).sum()
+
         if mpu is not None:
             dist.all_reduce(total_norm_cuda,
                             op=dist.ReduceOp.SUM,
                             group=mpu.get_model_parallel_group())
-        total_norm = total_norm_cuda[0].item()**(1. / norm_type)
 
-    if total_norm == float(
-            'inf') or total_norm == -float('inf') or total_norm != total_norm:
+        total_norm = total_norm_cuda.item()**(1. / norm_type)
+
+    if total_norm == float('inf') or total_norm == -float('inf') or total_norm != total_norm:
         total_norm = -1
 
     return total_norm
@@ -1007,12 +1116,17 @@ def all_gather_dp_groups(partitioned_param_groups,
                 ) - shard_id * shard_size
 
             shard_list = []
-            for dp_id in range(dp_world_size):
-                curr_shard = partitioned_params[dp_id].narrow(0,
-                                                              shard_id * shard_size,
-                                                              num_elements).detach()
-                shard_list.append(curr_shard)
+            with torch.no_grad():
+                for dp_id in range(dp_world_size):
+                    curr_shard = partitioned_params[dp_id].narrow(0,
+                                                                shard_id * shard_size,
+                                                                num_elements)
+                    shard_list.append(curr_shard)
 
-            dist.all_gather(shard_list,
-                            shard_list[partition_id],
-                            dp_process_group[group_id])
+                dist.all_gather(shard_list,
+                                shard_list[partition_id],
+                                dp_process_group[group_id])
+
+def typeof(obj):
+    return obj.dtype if hasattr(obj, 'dtype') else obj.type()
+

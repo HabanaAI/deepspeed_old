@@ -1,7 +1,10 @@
 import pytest
+import os
+import torch
 from unit.common import DistributedTest
 from unit.simple_model import UnusedParametersModel, random_dataloader
 from deepspeed.ops.op_builder import CPUAdamBuilder
+from unit.hpu import *
 
 import deepspeed
 
@@ -37,6 +40,17 @@ class TestStage2IgnoreUnusedParameters(DistributedTest):
             }
         }
         hidden_dim = 4
+        dtype=torch.half
+        if bool(pytest.use_hpu) == True:
+            if os.getenv("REPLACE_FP16", default=None):
+                config_dict["fp16"]["enabled"] = False
+                config_dict["fp32"] = {"enabled" : True}
+                dtype=torch.float
+                if get_hpu_dev_version() == "Gaudi":
+                    config_dict["communication_data_type"] = 'bfp16'
+            hpu_flag, msg = is_hpu_supported(config_dict)
+            if not hpu_flag:
+                pytest.skip(msg)
 
         model = UnusedParametersModel(hidden_dim=hidden_dim)
         model, _, _, _ = deepspeed.initialize(config=config_dict,
@@ -46,7 +60,8 @@ class TestStage2IgnoreUnusedParameters(DistributedTest):
         data_loader = random_dataloader(model=model,
                                         total_samples=10,
                                         hidden_dim=hidden_dim,
-                                        device=model.device)
+                                        device=model.device,
+                                        dtype=dtype)
 
         def _loop():
             for n, batch in enumerate(data_loader):

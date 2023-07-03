@@ -19,7 +19,7 @@ AUTO_MODULE_KEY = 'auto'
 
 class SDLoaderFactory:
     @staticmethod
-    def get_sd_loader_json(json_file, checkpoint_engine):
+    def get_sd_loader_json(json_file, checkpoint_engine, device=None):
         if isinstance(json_file, str):
             with open(json_file) as f:
                 data = json.load(f)
@@ -36,21 +36,29 @@ class SDLoaderFactory:
         return SDLoaderFactory.get_sd_loader(ckpt_list,
                                              checkpoint_engine,
                                              sd_type,
-                                             version)
+                                             version,
+                                             device)
 
     @staticmethod
-    def get_sd_loader(ckpt_list, checkpoint_engine, sd_type='Megatron', version=None):
+    def get_sd_loader(ckpt_list, checkpoint_engine, sd_type='Megatron', version=None, device=None):
         if sd_type == 'Megatron':
-            return MegatronSDLoader(ckpt_list, version, checkpoint_engine)
+            return MegatronSDLoader(ckpt_list, version, checkpoint_engine, device)
         else:
             assert False, '{} checkpoint type is not supported'.format(sd_type)
 
 
 class SDLoaderBase(ABC):
-    def __init__(self, ckpt_list, version, checkpoint_engine):
+    def __init__(self, ckpt_list, version, checkpoint_engine, device=None):
         self.module_key = None
         self.ckpt_list = ckpt_list
         self.version = version
+        if device == "hpu" or (hasattr(device, "type") and device.type == "hpu"):
+            self.map_location = torch.device("cpu")
+        else:
+            # From https://pytorch.org/docs/stable/generated/torch.load.html:
+            #   "The storage argument will be the initial deserialization of the storage, residing on the CPU."
+            # Therefore, we can use storage argument
+            self.map_location = lambda storage, loc: storage
         self.checkpoint_engine = TorchCheckpointEngine(
         ) if checkpoint_engine is None else checkpoint_engine
         self.check_ckpt_list()
@@ -95,8 +103,7 @@ class SDLoaderBase(ABC):
         if num_ckpt == mp_world_size:
             assert os.path.exists(load_path)
             #logger.info(f'rank: {mp_rank} loading checkpoint: {load_path}')
-            sd = self.checkpoint_engine.load(load_path, map_location=lambda storage, \
-                loc: storage)
+            sd = self.checkpoint_engine.load(load_path, map_location=self.map_location)
 
             if quantize:
                 quantizer = WeightQuantization(mlp_extra_grouping=mlp_extra_grouping,
@@ -125,10 +132,8 @@ class SDLoaderBase(ABC):
 
         logger.info(f"mp_rank: {mp_rank}, ckpt_list: {ckpt_list}")
         sd_list = [
-            self.checkpoint_engine.load(ckpt,
-                                        map_location=lambda storage,
-                                        loc: storage) for ckpt in ckpt_list
-        ]
+            self.checkpoint_engine.load(ckpt, map_location=self.map_location) for ckpt in ckpt_list
+            ]
         return sd_list
 
     def get_split_state_dict(self, mp_world_size, mp_rank):
@@ -144,8 +149,7 @@ class SDLoaderBase(ABC):
         )
 
         sd = self.checkpoint_engine.load(self.ckpt_list[ckpt_index],
-                                         map_location=lambda storage,
-                                         loc: storage)
+                                        map_location=self.map_location)
 
         return sd, num_to_split, ckpt_offset
 
@@ -179,8 +183,7 @@ class SDLoaderBase(ABC):
         assert len(self.ckpt_list) > 0
 
         sd = self.checkpoint_engine.load(self.ckpt_list[0],
-                                         map_location=lambda storage,
-                                         loc: storage)
+                                        map_location=self.map_location)
 
         # check checkpoint count is same with saved mp_world_size
         if 'mp_world_size' in sd.keys():
@@ -212,8 +215,8 @@ class SDLoaderBase(ABC):
 
 
 class MegatronSDLoader(SDLoaderBase):
-    def __init__(self, ckpt_list, version, checkpoint_engine):
-        super().__init__(ckpt_list, version, checkpoint_engine)
+    def __init__(self, ckpt_list, version, checkpoint_engine, device=None):
+        super().__init__(ckpt_list, version, checkpoint_engine, device)
         """
         ## Q/K/V data need special processing
         key: transformer.layers.0.attention.query_key_value.weight, shape: torch.Size([3192, 4256])
@@ -451,8 +454,7 @@ class MegatronSDLoader(SDLoaderBase):
         ]
 
         sd = self.checkpoint_engine.load(ckpt_file_name,
-                                         map_location=lambda storage,
-                                         loc: storage)
+                                        map_location=self.map_location)
 
         # partial_key is a sub-string of one key in the sd
         def check_key_exist(partial_key, sd):

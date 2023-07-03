@@ -13,8 +13,14 @@ QUEUE_DEPTH = 2
 IO_SIZE = 16 * MEGA_BYTE
 IO_PARALLEL = 2
 
+m_device = "hpu" if bool(pytest.use_hpu) else "cpu"
+
+if bool(pytest.use_hpu) == True:
+    import habana_frameworks.torch.core as htcore
+
+
 if not deepspeed.ops.__compatible_ops__[AsyncIOBuilder.NAME]:
-    pytest.skip('Skip tests since async-io is not compatible', allow_module_level=True)
+    pytestmark = pytest.mark.skip(reason='Skip tests since async-io is not compatible')
 
 
 def _do_ref_write(tmpdir, index=0):
@@ -30,10 +36,10 @@ def _do_ref_write(tmpdir, index=0):
 def _get_test_file_and_buffer(tmpdir, ref_buffer, cuda_device, index=0):
     file_suffix = f'{dist.get_rank()}_{index}'
     test_file = os.path.join(tmpdir, f'_aio_write_random_{file_suffix}.pt')
-    if cuda_device:
+    if cuda_device and bool(pytest.use_hpu) == False:
         test_buffer = torch.cuda.ByteTensor(list(ref_buffer))
     else:
-        test_buffer = torch.ByteTensor(list(ref_buffer)).pin_memory()
+        test_buffer = torch.ByteTensor(list(ref_buffer)).to(m_device).pin_memory()
 
     return test_file, test_buffer
 
@@ -54,7 +60,7 @@ class TestRead(DistributedTest):
     def test_parallel_read(self, tmpdir, single_submit, overlap_events):
         ref_file, _ = _do_ref_write(tmpdir)
 
-        aio_buffer = torch.empty(IO_SIZE, dtype=torch.uint8, device='cpu').pin_memory()
+        aio_buffer = torch.empty(IO_SIZE, dtype=torch.uint8, device=m_device).pin_memory()
         h = AsyncIOBuilder().load().aio_handle(BLOCK_SIZE,
                                                QUEUE_DEPTH,
                                                single_submit,
@@ -70,16 +76,18 @@ class TestRead(DistributedTest):
             ref_buffer = list(f.read())
         assert ref_buffer == aio_buffer.tolist()
 
-    @pytest.mark.parametrize("cuda_device", [True, False])
+    @pytest.mark.parametrize("cuda_device", [True, pytest.param(False,
+                                                    marks=pytest.mark.skipif(bool(pytest.use_hpu) == True,
+                                                    reason="HPU not supported pinned memory with CPU device"))])
     def test_async_read(self, tmpdir, single_submit, overlap_events, cuda_device):
         ref_file, _ = _do_ref_write(tmpdir)
 
-        if cuda_device:
+        if cuda_device and bool(pytest.use_hpu) == False:
             aio_buffer = torch.empty(IO_SIZE, dtype=torch.uint8, device='cuda')
         else:
             aio_buffer = torch.empty(IO_SIZE,
                                      dtype=torch.uint8,
-                                     device='cpu').pin_memory()
+                                     device=m_device).pin_memory()
 
         h = AsyncIOBuilder().load().aio_handle(BLOCK_SIZE,
                                                QUEUE_DEPTH,
@@ -125,7 +133,9 @@ class TestWrite(DistributedTest):
         filecmp.clear_cache()
         assert filecmp.cmp(ref_file, aio_file, shallow=False)
 
-    @pytest.mark.parametrize("cuda_device", [True, False])
+    @pytest.mark.parametrize("cuda_device", [True, pytest.param(False,
+                                                    marks=pytest.mark.skipif(bool(pytest.use_hpu) == True,
+                                                    reason="HPU not supported pinned memory with CPU device"))])
     def test_async_write(self, tmpdir, single_submit, overlap_events, cuda_device):
         ref_file, ref_buffer = _do_ref_write(tmpdir)
         aio_file, aio_buffer = _get_test_file_and_buffer(tmpdir, ref_buffer, cuda_device)
@@ -150,7 +160,9 @@ class TestWrite(DistributedTest):
         assert filecmp.cmp(ref_file, aio_file, shallow=False)
 
 
-@pytest.mark.parametrize("cuda_device", [True, False])
+@pytest.mark.parametrize("cuda_device", [True, pytest.param(False,
+                                                marks=pytest.mark.skipif(bool(pytest.use_hpu) == True,
+                                                reason="HPU not supported pinned memory with CPU device"))])
 class TestAsyncQueue(DistributedTest):
     world_size = 2
 
@@ -163,10 +175,11 @@ class TestAsyncQueue(DistributedTest):
 
         aio_buffers = []
         for i in range(async_queue):
-            if cuda_device:
+            if cuda_device and bool(pytest.use_hpu) == False:
                 buf = torch.empty(IO_SIZE, dtype=torch.uint8, device='cuda')
             else:
-                buf = torch.empty(IO_SIZE, dtype=torch.uint8, device='cpu').pin_memory()
+                buf = torch.empty(IO_SIZE, dtype=torch.uint8, device=m_device).pin_memory()
+
             aio_buffers.append(buf)
 
         single_submit = True

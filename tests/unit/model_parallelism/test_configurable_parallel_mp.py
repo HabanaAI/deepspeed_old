@@ -14,6 +14,10 @@ pytestmark = pytest.mark.skipif(
     TORCH_MAJOR < 1 or (TORCH_MAJOR == 1 and TORCH_MINOR < 5),
     reason='Megatron-LM package requires Pytorch version 1.5 or above')
 
+pytestmark = pytest.mark.skipif(
+    bool(pytest.use_hpu) == True,
+    reason="Megatorn-LM pacakge is not supported HPU backend")
+
 
 def get_deepspeed_model(model):
     ds_config_dict = {
@@ -40,7 +44,8 @@ class ConfigurableMP(DistributedTest):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+        if not bool(pytest.use_hpu) == True:
+            torch.cuda.manual_seed_all(seed)
 
     @pytest.fixture
     def inputs(self, bs=1, seq_len=20):
@@ -68,7 +73,10 @@ class TestConfigurableMP(ConfigurableMP):
         model = get_deepspeed_model(model)
 
         model.eval()
-        baseline = model(inputs[0].cuda(), inputs[1].cuda(), inputs[2].cuda())
+        if bool(pytest.use_hpu) == True:
+            baseline = model(inputs[0].to('hpu'), inputs[1].to('hpu'), inputs[2].to('hpu'))
+        else:
+            baseline = model(inputs[0].cuda(), inputs[1].cuda(), inputs[2].cuda())
 
         tag = 'mp_1'
         state_dict = {}
@@ -97,7 +105,10 @@ class TestConfigurableMP(ConfigurableMP):
 
         model.eval()
 
-        baseline = model(inputs[0].cuda(), inputs[1].cuda(), inputs[2].cuda())
+        if bool(pytest.use_hpu) == True:
+            baseline = model(inputs[0].to('hpu'), inputs[1].to('hpu'), inputs[2].to('hpu'))
+        else:
+            baseline = model(inputs[0].cuda(), inputs[1].cuda(), inputs[2].cuda())
 
         tag = 'mp_2'
         state_dict = {}
@@ -131,7 +142,10 @@ class baseline_mp2(DistributedFixture):
         model.eval()
 
         with torch.no_grad():
-            baseline = model(inputs[0].cuda(), inputs[1].cuda(), inputs[2].cuda())
+            if bool(pytest.use_hpu) == True:
+                baseline = model(inputs[0].to('hpu'), inputs[1].to('hpu'), inputs[2].to('hpu'))
+            else:
+                baseline = model(inputs[0].cuda(), inputs[1].cuda(), inputs[2].cuda())
             if dist.get_rank() == 0:
                 save_path = os.path.join(class_tmpdir, "output.pt")
                 torch.save(baseline.cpu(), save_path)
@@ -162,7 +176,10 @@ class TestConfigurableResizeMP(ConfigurableMP):
             model.load_checkpoint(class_tmpdir,
                                   load_optimizer_states=False,
                                   load_lr_scheduler_states=False)
-            test = model(inputs[0].cuda(), inputs[1].cuda(), inputs[2].cuda())
+            if bool(pytest.use_hpu) == True:
+                test = model(inputs[0].to('hpu'), inputs[1].to('hpu'), inputs[2].to('hpu'))
+            else:
+                test = model(inputs[0].cuda(), inputs[1].cuda(), inputs[2].cuda())
             if dist.get_rank() == 0:
                 load_path = os.path.join(class_tmpdir, "output.pt")
                 baseline = torch.load(load_path)

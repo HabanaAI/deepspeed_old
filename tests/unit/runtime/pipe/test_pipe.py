@@ -7,13 +7,13 @@ from deepspeed.runtime.pipe.topology import PipeDataParallelTopology
 from deepspeed.runtime.pipe.module import PipelineModule
 from unit.alexnet_model import AlexNetPipe, train_cifar
 from unit.common import DistributedTest
+from unit.hpu import *
 
 PipeTopo = PipeDataParallelTopology
 
 
 def rel_diff(A, B):
     return abs(A - B) / abs(A)
-
 
 @pytest.mark.parametrize('topo_config',
                          [
@@ -59,17 +59,22 @@ class TestPipeCifar10(DistributedTest):
                 "activation_checkpoint_interval": 1
             }
         }
-
+        if bool(pytest.use_hpu) == True:
+            if get_hpu_dev_version() == "Gaudi":
+                os.environ['PT_ENABLE_COMM_GROUP_CACHE'] = "true"
         topo = PipeTopo(**topo_config)
         steps = 500  # must be >=100
-
+        # set random seed to make sure the weights in all ranks are the same for both dp/pp
+        import deepspeed.runtime.utils as ds_utils
+        ds_utils.set_random_seed(0)
         # Allocate model for consistent initial weights.
         init_net = AlexNetPipe()
 
         base_net = copy.deepcopy(init_net)
         base_model = PipelineModule(layers=base_net.to_layers(),
                                     num_stages=1,
-                                    loss_fn=nn.CrossEntropyLoss())
+                                    loss_fn=nn.CrossEntropyLoss(),
+                                    use_hpu=(bool(pytest.use_hpu) == True))
 
         # Train with just data parallelism
         base_losses = train_cifar(base_model,
@@ -80,7 +85,8 @@ class TestPipeCifar10(DistributedTest):
         test_net = copy.deepcopy(init_net)
         test_model = PipelineModule(layers=test_net.to_layers(),
                                     topology=topo,
-                                    loss_fn=nn.CrossEntropyLoss())
+                                    loss_fn=nn.CrossEntropyLoss(),
+                                    use_hpu=(bool(pytest.use_hpu) == True))
 
         test_losses = train_cifar(test_model,
                                   config=config_dict,

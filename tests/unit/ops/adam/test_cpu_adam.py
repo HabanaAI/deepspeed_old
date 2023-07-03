@@ -2,13 +2,19 @@ import torch
 import numpy as np
 import pytest
 from cpuinfo import get_cpu_info
+import os
 
 import deepspeed
 from deepspeed.ops.adam import FusedAdam
 from deepspeed.ops.op_builder import CPUAdamBuilder
 
 if not deepspeed.ops.__compatible_ops__[CPUAdamBuilder.NAME]:
-    pytest.skip("cpu-adam is not compatible", allow_module_level=True)
+    pytestmark = pytest.mark.skip(
+        reason="cpu-adam is not compatible")
+
+if bool(pytest.use_hpu) == True:
+    from habana_frameworks.torch.utils.library_loader import load_habana_module
+
 
 pytest.cpu_vendor = get_cpu_info()["vendor_id_raw"].lower()
 
@@ -37,7 +43,8 @@ def check_equal(first, second, atol=1e-2, verbose=False):
 def test_cpu_adam_opt(dtype, model_size):
     if ("amd" in pytest.cpu_vendor) and (dtype == torch.half):
         pytest.skip("cpu-adam with half precision not supported on AMD CPUs")
-
+    if dtype==torch.float16 and bool(pytest.use_hpu) == True and os.getenv("REPLACE_FP16", default = None):
+            dtype=torch.bfloat16
     from deepspeed.ops.adam import DeepSpeedCPUAdam
     device = 'cpu'
     rng_state = torch.get_rng_state()
@@ -46,11 +53,18 @@ def test_cpu_adam_opt(dtype, model_size):
     param1_data = torch.randn(model_size, device=device)
     param1 = torch.nn.Parameter(param1_data)
     torch.set_rng_state(rng_state)
-    param2_data = torch.randn(model_size, device=device).to(dtype).cuda()
+    if bool(pytest.use_hpu) == True:
+        param2_data = torch.randn(model_size, device=device).to(dtype).to('hpu')
+    else:
+        param2_data = torch.randn(model_size, device=device).to(dtype).cuda()
     param2 = torch.nn.Parameter(param2_data)
 
     optimizer1 = torch.optim.AdamW([param1])
-    optimizer2 = FusedAdam([param2])
+    if pytest.use_hpu:
+        from habana_frameworks.torch.hpex.optimizers import FusedAdamW
+        optimizer2 = FusedAdamW([param2])
+    else:
+        optimizer2 = FusedAdam([param2])
     optimizer = DeepSpeedCPUAdam([param])
 
     for i in range(10):
@@ -59,7 +73,10 @@ def test_cpu_adam_opt(dtype, model_size):
         torch.set_rng_state(rng_state)
         param1.grad = torch.randn(model_size, device=device)
         torch.set_rng_state(rng_state)
-        param2.grad = torch.randn(model_size, device=device).to(dtype).cuda()
+        if bool(pytest.use_hpu) == True:
+            param2.grad = torch.randn(model_size, device=device).to(dtype).to('hpu')
+        else:
+            param2.grad = torch.randn(model_size, device=device).to(dtype).cuda()
 
         optimizer.step()
         optimizer2.step()
@@ -78,7 +95,10 @@ def test_cpu_adam_opt(dtype, model_size):
 def test_cpu_adam_gpu_error():
     model_size = 64
     from deepspeed.ops.adam import DeepSpeedCPUAdam
-    device = 'cuda:0'
+    if bool(pytest.use_hpu) == True:
+        device = 'hpu:0'
+    else:
+        device = 'cuda:0'
     param = torch.nn.Parameter(torch.randn(model_size, device=device))
     optimizer = DeepSpeedCPUAdam([param])
 

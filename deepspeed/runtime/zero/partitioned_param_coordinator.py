@@ -68,6 +68,8 @@ class PartitionedParameterCoordinator:
         max_available_parameters_in_numel: int,
         allgather_stream: Stream,
         prefetch_nvme: bool = False,
+        use_hpu=False,
+        no_cuda=False
     ) -> None:
         # mapping of param -> handle for each param that is currently in flight
         self.__inflight_param_registry = __class__.__InflightParamRegistry()
@@ -93,9 +95,11 @@ class PartitionedParameterCoordinator:
         self.__prefetch_bucket_sz: int = prefetch_bucket_sz
         self.__prefetch_nvme: bool = prefetch_nvme
         self.hierarchy: int = 0
+        self.use_hpu = use_hpu
+        self.no_cuda = no_cuda
 
         # stream that will be used for allgather operations
-        self.__allgather_stream: Stream = allgather_stream
+        self.__allgather_stream = allgather_stream
 
         # limit the number of fetch events that can be queued at once
         # otherwise, what happens is memory is allocated by the host thread at the
@@ -106,7 +110,7 @@ class PartitionedParameterCoordinator:
         # cudaMallocAsync/cudaFreeAsync. Choosing to not expose this to the user now
         # because ideally in the future its replaced by an async allocation
         # mechanism which doesn't require any configuration by the user.
-        self.__ongoing_fetch_events: Deque[Event] = collections.deque()
+        self.__ongoing_fetch_events = collections.deque()
         # TODO. make this configurable via JSON
         self.__max_ongoing_fetch_events: int = 2
 
@@ -262,22 +266,24 @@ class PartitionedParameterCoordinator:
             param.ds_active_sub_modules.add(current_submodule.id)
             debug_rank0(f"-wait: {param.ds_summary()}")
             if param in self.__inflight_param_registry:
-                with torch.cuda.stream(self.__allgather_stream):
-                    while self.__ongoing_fetch_events and self.__ongoing_fetch_events[
-                            0].query():
-                        self.__ongoing_fetch_events.popleft()
-                    if len(self.__ongoing_fetch_events
-                           ) > self.__max_ongoing_fetch_events:
-                        self.__ongoing_fetch_events.popleft().synchronize()
+                with get_stream(self.__allgather_stream, self.use_hpu, self.no_cuda):
+                    if not self.use_hpu:
+                        while self.__ongoing_fetch_events and self.__ongoing_fetch_events[
+                                0].query():
+                            self.__ongoing_fetch_events.popleft()
+                        if len(self.__ongoing_fetch_events
+                            ) > self.__max_ongoing_fetch_events:
+                            self.__ongoing_fetch_events.popleft().synchronize()
 
                     self.__inflight_param_registry.pop(param).wait()
 
-                    event = Event()
-                    event.record()
-                    self.__ongoing_fetch_events.append(event)
+                    if not self.use_hpu:
+                        event = create_event(self.use_hpu, self.no_cuda)
+                        event.record()
+                        self.__ongoing_fetch_events.append(event)
 
             assert param.ds_status == ZeroParamStatus.AVAILABLE, param.ds_summary()
-        torch.cuda.current_stream().wait_stream(self.__allgather_stream)
+        get_current_stream(self.use_hpu, self.no_cuda).wait_stream(self.__allgather_stream)
 
         # kick off parameter prefetches for upcoming modules
         # don't prefetch if we dont have a completed model trace
@@ -395,7 +401,7 @@ class PartitionedParameterCoordinator:
                 self.__n_available_params += param.ds_numel
 
         if partitioned_params:
-            with torch.cuda.stream(self.__allgather_stream):
+            with get_stream(self.__allgather_stream, self.use_hpu, self.no_cuda):
                 handle = partitioned_params[0].all_gather_coalesced(partitioned_params)
 
             for param in partitioned_params:
